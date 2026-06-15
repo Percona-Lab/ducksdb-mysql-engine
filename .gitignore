@@ -6,3 +6,4 @@ build/
 results/
 bench/results/
 bench/data/
+dist/
