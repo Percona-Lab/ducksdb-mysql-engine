@@ -1,0 +1,43 @@
+# Whole-query pushdown: a plain ENGINE=DuckDB table's analytical
+# queries execute inside DuckDB automatically via the
+# server hook — no INSTALL PLUGIN, no SECONDARY_ENGINE / SECONDARY_LOAD.
+# Ducksdb_pushdown_count proves a query actually ran in DuckDB.
+CREATE DATABASE pd;
+USE pd;
+CREATE TABLE t (id INT PRIMARY KEY, y INT, region INT,
+                price DECIMAL(12,2), qty INT) ENGINE=DuckDB;
+INSERT INTO t VALUES
+ (1,2021,1,100.00,10),(2,2021,1,200.50,20),(3,2022,2,300.25,30),
+ (4,2022,3,400.00,40),(5,2022,2,500.75,50),(6,2023,1,600.00,60);
+
+--echo #### GROUP BY aggregate -> pushed to DuckDB ####
+SELECT VARIABLE_VALUE INTO @p0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+SELECT region, COUNT(*) c, SUM(qty) sq, SUM(price*qty) rev
+  FROM t WHERE y>=2022 GROUP BY region ORDER BY region;
+--echo # pushdown engaged (counter +1):
+SELECT VARIABLE_VALUE-@p0 AS pushed FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+
+--echo #### implicit aggregate -> pushed ####
+SELECT VARIABLE_VALUE INTO @p1 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+SELECT COUNT(*) n, MIN(price) mn, MAX(qty) mx FROM t;
+SELECT VARIABLE_VALUE-@p1 AS pushed FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+
+--echo #### point/non-aggregate query -> NOT pushed (normal row path), still correct ####
+SELECT VARIABLE_VALUE INTO @p2 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+SELECT id, y, region FROM t WHERE id=3;
+SELECT VARIABLE_VALUE-@p2 AS not_pushed FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+
+--echo #### EXPLAIN works (pushdown declines under EXPLAIN so a plan is shown) ####
+--disable_result_log
+EXPLAIN SELECT region, COUNT(*) FROM t GROUP BY region;
+--enable_result_log
+--echo # EXPLAIN did not error
+
+DROP TABLE t;
+DROP DATABASE pd;

@@ -1,0 +1,17 @@
+# Smoke test: the DuckDB engine is built into the server (MANDATORY) — no
+# INSTALL PLUGIN needed. Basic CRUD on an ENGINE=DuckDB table must work.
+--echo # DuckDB is a built-in (mandatory) engine
+SELECT engine, support FROM information_schema.engines WHERE engine='DuckDB';
+
+CREATE DATABASE eng;
+USE eng;
+CREATE TABLE t (id INT PRIMARY KEY, v INT, s VARCHAR(16)) ENGINE=DuckDB;
+INSERT INTO t VALUES (1,10,'a'),(2,20,'b'),(3,30,'c');
+--sorted_result
+SELECT * FROM t;
+UPDATE t SET v=99 WHERE id=2;
+DELETE FROM t WHERE id=3;
+SELECT id, v, s FROM t ORDER BY id;
+SELECT COUNT(*) AS n, SUM(v) AS sv FROM t;
+DROP TABLE t;
+DROP DATABASE eng;

@@ -1,0 +1,46 @@
+CREATE DATABASE pd;
+USE pd;
+CREATE TABLE t (id INT PRIMARY KEY, y INT, region INT,
+price DECIMAL(12,2), qty INT) ENGINE=DuckDB;
+INSERT INTO t VALUES
+(1,2021,1,100.00,10),(2,2021,1,200.50,20),(3,2022,2,300.25,30),
+(4,2022,3,400.00,40),(5,2022,2,500.75,50),(6,2023,1,600.00,60);
+#### GROUP BY aggregate -> pushed to DuckDB ####
+SELECT VARIABLE_VALUE INTO @p0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+SELECT region, COUNT(*) c, SUM(qty) sq, SUM(price*qty) rev
+FROM t WHERE y>=2022 GROUP BY region ORDER BY region;
+region	c	sq	rev
+1	1	60	36000.00
+2	2	80	34045.00
+3	1	40	16000.00
+# pushdown engaged (counter +1):
+SELECT VARIABLE_VALUE-@p0 AS pushed FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+pushed
+1
+#### implicit aggregate -> pushed ####
+SELECT VARIABLE_VALUE INTO @p1 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+SELECT COUNT(*) n, MIN(price) mn, MAX(qty) mx FROM t;
+n	mn	mx
+6	100.00	60
+SELECT VARIABLE_VALUE-@p1 AS pushed FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+pushed
+1
+#### point/non-aggregate query -> NOT pushed (normal row path), still correct ####
+SELECT VARIABLE_VALUE INTO @p2 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+SELECT id, y, region FROM t WHERE id=3;
+id	y	region
+3	2022	2
+SELECT VARIABLE_VALUE-@p2 AS not_pushed FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+not_pushed
+0
+#### EXPLAIN works (pushdown declines under EXPLAIN so a plan is shown) ####
+EXPLAIN SELECT region, COUNT(*) FROM t GROUP BY region;
+# EXPLAIN did not error
+DROP TABLE t;
+DROP DATABASE pd;

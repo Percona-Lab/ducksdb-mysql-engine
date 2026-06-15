@@ -1,0 +1,8 @@
+# Heavy build inputs / outputs — not source
+vendor/
+build/
+*.o
+*.a
+results/
+bench/results/
+bench/data/

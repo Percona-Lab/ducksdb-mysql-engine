@@ -1,0 +1,24 @@
+# DuckDB is a built-in (mandatory) engine
+SELECT engine, support FROM information_schema.engines WHERE engine='DuckDB';
+engine	support
+DuckDB	YES
+CREATE DATABASE eng;
+USE eng;
+CREATE TABLE t (id INT PRIMARY KEY, v INT, s VARCHAR(16)) ENGINE=DuckDB;
+INSERT INTO t VALUES (1,10,'a'),(2,20,'b'),(3,30,'c');
+SELECT * FROM t;
+id	v	s
+1	10	a
+2	20	b
+3	30	c
+UPDATE t SET v=99 WHERE id=2;
+DELETE FROM t WHERE id=3;
+SELECT id, v, s FROM t ORDER BY id;
+id	v	s
+1	10	a
+2	99	b
+SELECT COUNT(*) AS n, SUM(v) AS sv FROM t;
+n	sv
+2	109
+DROP TABLE t;
+DROP DATABASE eng;
