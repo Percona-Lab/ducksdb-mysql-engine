@@ -1,0 +1,19 @@
+sequenceDiagram
+    participant C as Client
+    participant S as MySQL SQL layer
+    participant H as ha_duckdb
+    participant D as ddl_convertor + duckdb_types
+    participant X as EngineContext
+    participant K as DuckDB (schema file)
+
+    C->>S: CREATE TABLE t (...) ENGINE=DuckDB
+    S->>H: create(name, form, create_info)
+    H->>H: parse_db_table(name) -> (db, tbl)
+    H->>D: BuildCreateTableSQL(db, tbl, form)
+    D->>D: MySQLToDuckDB(field) per column (decline INVALID types)
+    D-->>H: CREATE TABLE "t" (...)
+    H->>X: Connection(db)
+    X-->>H: connection on db.duckdb
+    H->>K: Query(CREATE TABLE ...)
+    K-->>H: ok / error
+    H-->>S: 0 / HA_ERR_GENERIC (+ DuckDB message)

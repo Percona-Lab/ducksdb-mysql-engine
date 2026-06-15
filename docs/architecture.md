@@ -13,47 +13,7 @@ shim (`engine/`), the shared bridge layer (`common/`), and embedded DuckDB. A
 small server patch adds the `pushdown_select` hook that the engine uses for
 whole-query offload.
 
-```mermaid
-flowchart TB
-    client["MySQL client / application"]
-
-    subgraph server["mysqld (MySQL 9.7 server)"]
-        sqllayer["SQL layer: parser / resolver / optimizer"]
-        joinopt["JOIN::optimize()\n(pushdown_select hook — server patch)"]
-        handlerapi["Handler API\n(open/close, rnd_*, index_*,\nwrite/update/delete_row, info)"]
-    end
-
-    subgraph engine["engine/ — DuckDB storage engine"]
-        ha["ha_duckdb\n(handler + handlerton registration)"]
-        pd["duckdb_pushdown\n(whole-query AST→SQL builder,\nExecutePushdown, PlanRegistry)"]
-    end
-
-    subgraph common["common/ — shared bridge layer"]
-        ctx["EngineContext\n(per-schema DuckDB instance registry)"]
-        types["duckdb_types\n(MySQL ↔ DuckDB type mapping)"]
-        ddl["ddl_convertor"]
-        dml["dml_convertor"]
-        scan["duckdb_scan (ScanCursor)"]
-        appender["duckdb_appender (BulkAppender)"]
-        xa["duckdb_xa\n(per-THD connections, commit/rollback/XA)"]
-        cond["cond_pushdown\n(WHERE superset translation)"]
-        util["duckdb_sql_util\n(QuoteIdent / FieldLiteral)"]
-    end
-
-    subgraph duck["Embedded DuckDB (static library)"]
-        instr["DuckDB instances"]
-        files[("Per-schema files:\nshop.duckdb, analytics.duckdb, ...")]
-    end
-
-    client --> sqllayer --> joinopt
-    joinopt -->|"all base tables ENGINE=DuckDB"| pd
-    sqllayer --> handlerapi --> ha
-    ha --> ddl & dml & scan & appender & cond & util & xa & ctx
-    pd --> ctx & types
-    ha --> types
-    ctx --> instr --> files
-    xa --> instr
-```
+![Engine components](images/components.png)
 
 ### Layer responsibilities
 
@@ -128,23 +88,7 @@ computes the path as `<mysql_real_data_home>/<schema>.duckdb` and keeps a
 process-wide registry of open instances, created lazily on first use and
 protected by a shared mutex.
 
-```mermaid
-flowchart LR
-    subgraph mysql["MySQL schemas"]
-        s1["schema: shop"]
-        s2["schema: analytics"]
-    end
-    subgraph ctx["EngineContext registry"]
-        i1["DuckDB instance (shop)"]
-        i2["DuckDB instance (analytics)"]
-    end
-    subgraph dd["datadir"]
-        f1[("shop.duckdb")]
-        f2[("analytics.duckdb")]
-    end
-    s1 --> i1 --> f1
-    s2 --> i2 --> f2
-```
+![Per-schema file model](images/per-schema-files.png)
 
 A direct consequence is that a single DuckDB statement cannot span two schemas:
 the whole-query pushdown builder enforces a **single-schema guard** (all base
@@ -159,27 +103,7 @@ path-style argument, builds a DuckDB `CREATE TABLE` from the MySQL column
 definitions and primary key, and runs it on a connection to that schema's file.
 `DROP TABLE`, `RENAME`, and `TRUNCATE` follow the same shape.
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant S as MySQL SQL layer
-    participant H as ha_duckdb
-    participant D as ddl_convertor + duckdb_types
-    participant X as EngineContext
-    participant K as DuckDB (schema file)
-
-    C->>S: CREATE TABLE t (...) ENGINE=DuckDB
-    S->>H: create(name, form, create_info)
-    H->>H: parse_db_table(name) -> (db, tbl)
-    H->>D: BuildCreateTableSQL(db, tbl, form)
-    D->>D: MySQLToDuckDB(field) per column (decline INVALID types)
-    D-->>H: CREATE TABLE "t" (...)
-    H->>X: Connection(db)
-    X-->>H: connection on db.duckdb
-    H->>K: Query(CREATE TABLE ...)
-    K-->>H: ok / error
-    H-->>S: 0 / HA_ERR_GENERIC (+ DuckDB message)
-```
+![DDL path: CREATE TABLE to DuckDB](images/ddl-path.png)
 
 Unsupported column types cause `BuildCreateTableSQL` to throw, which the handler
 turns into a clear error rather than creating a partial table.
@@ -193,33 +117,7 @@ through the per-THD, transaction-scoped connection (`txn_conn()`), which begins
 the DuckDB transaction once and registers the engine with MySQL's transaction
 coordinator.
 
-```mermaid
-sequenceDiagram
-    participant S as MySQL SQL layer
-    participant H as ha_duckdb
-    participant A as BulkAppender / dml_convertor
-    participant T as ThdState (duckdb_xa)
-    participant K as DuckDB (schema file)
-
-    Note over S,H: INSERT (bulk)
-    S->>H: start_bulk_insert(rows)
-    H->>A: open Appender on table
-    loop each row
-        S->>H: write_row(buf)
-        H->>A: AppendRow(table) via AppendField per column
-    end
-    S->>H: end_bulk_insert()
-    H->>A: Flush()
-    H->>H: invalidate cached row count
-
-    Note over S,H: UPDATE / DELETE
-    S->>H: update_row(old,new) / delete_row(buf)
-    H->>T: txn_conn() (Begin once, RegisterTx)
-    H->>A: BuildPreparedUpdateSQL/DeleteSQL (once), Bind params
-    A->>K: prepared Execute (PK-located)
-    K-->>H: ok / duplicate-key / error
-    H->>H: invalidate cached row count
-```
+![Write path](images/write-path.png)
 
 The prepared `UPDATE`/`DELETE` plans are created lazily on first use and dropped
 at the statement boundary (`reset()`). If the primary key is absent, or the
@@ -237,27 +135,7 @@ derived from the key and the comparison operator, plus any condition pushed via
 `cond_push`. Results are fetched chunk by chunk and decoded directly from
 DuckDB's column vectors with typed accessors (`StoreFlatCell`).
 
-```mermaid
-sequenceDiagram
-    participant S as MySQL SQL layer
-    participant H as ha_duckdb
-    participant SC as ScanCursor (duckdb_scan)
-    participant K as DuckDB (schema file)
-
-    S->>H: rnd_init(scan) / index_read_map(key, flag)
-    H->>H: build_projection() (read_set + PK)
-    opt index read
-        H->>H: WHERE from key parts + cond_push
-    end
-    H->>SC: Init(select_list, where, order)
-    SC->>K: SELECT ... (materialized: Query, not stream)
-    K-->>SC: result, first chunk (flattened)
-    loop each row
-        S->>H: rnd_next / index_next
-        H->>SC: Next(&chunk, &row)
-        H->>H: StoreFlatCell into record[0]
-    end
-```
+![Read path (point lookup / scan)](images/read-path.png)
 
 The scan deliberately materializes the result (`Query`, not a streaming
 `SendQuery`) so a full-scan `UPDATE`/`DELETE` that issues per-row writes on the
@@ -273,42 +151,7 @@ per-THD registry. The optimizer then installs `ExecutePushdown` as the override
 executor. At execute time the prepared statement runs in DuckDB and the result is
 staged into a temporary table and streamed back to the client.
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant J as JOIN::optimize() (server patch)
-    participant P as PushdownSelect (duckdb_pushdown)
-    participant B as BuildPushdownSQLBuilder
-    participant R as PlanRegistry (per-THD)
-    participant E as ExecutePushdown (override_executor_func)
-    participant K as DuckDB (schema file)
-    participant Q as Query_result
-
-    C->>J: SELECT ... FROM duckdb_tables ...
-    J->>P: pushdown_select(thd, join)
-    P->>B: BuildPushdownSQLBuilder(thd, join)
-    B->>B: gates (simple, grouped, no subquery/window/rollup)
-    B->>B: RenderFrom / RenderSelectItem / RenderPredicate / RenderAggregate / GROUP BY / ORDER BY / LIMIT
-    alt any node not translatable
-        B-->>P: false (DECLINE)
-        P-->>J: return false, override unset
-        J->>J: normal iterator execution (fallback)
-    else fully translatable
-        B-->>P: SQL + bound params + schema
-        P->>K: Connection(db).Prepare(sql)
-        P->>R: Put(thd, plan{conn, prepared})
-        P-->>J: set override_executor_func, return false
-        J->>E: run override executor
-        E->>R: Take(thd) -> plan
-        E->>K: prepared Execute(params)
-        K-->>E: materialized result (chunks)
-        E->>E: stage in temp table, StoreFlatCell per cell
-        loop each row
-            E->>Q: send_data(row)
-        end
-        E->>E: Ducksdb_pushdown_count += 1
-    end
-```
+![Whole-query pushdown path](images/pushdown-path.png)
 
 ### The decline contract
 
@@ -378,37 +221,7 @@ held in a `ThdState` stored on `THD->ha_data`. The first DML or scan begins the
 DuckDB transaction (once) and registers the engine with MySQL's transaction
 coordinator, so MySQL drives the engine's commit and rollback.
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant S as MySQL transaction coordinator
-    participant H as ha_duckdb / duckdb_xa
-    participant T as ThdState (per-THD connections)
-    participant K as DuckDB
-
-    C->>H: first DML/scan in statement
-    H->>T: Acquire(schema) + Begin (BEGIN TRANSACTION once)
-    H->>S: trans_register_ha (statement, and real txn if open)
-
-    alt COMMIT / autocommit statement end
-        C->>S: COMMIT
-        S->>H: Commit(thd, all)
-        H->>T: COMMIT on each connection
-        H->>H: ResetThdState (close connections)
-    else ROLLBACK
-        C->>S: ROLLBACK
-        S->>H: Rollback(thd, all)
-        H->>T: ROLLBACK on each connection
-    end
-
-    Note over S,H: XA two-phase
-    C->>S: XA PREPARE
-    S->>H: Prepare(thd, all)
-    H->>H: hand open connections to XID-keyed registry (not committed)
-    C->>S: XA COMMIT / XA ROLLBACK (any session)
-    S->>H: CommitByXid / RollbackByXid
-    H->>K: COMMIT / ROLLBACK on the prepared connections
-```
+![Transaction and XA flow](images/transaction-xa.png)
 
 A statement-level commit inside an explicit `BEGIN ... COMMIT` transaction is a
 no-op; the DuckDB transaction stays open until the explicit `COMMIT`/`ROLLBACK`.

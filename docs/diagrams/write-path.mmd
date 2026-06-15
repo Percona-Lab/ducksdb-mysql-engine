@@ -1,0 +1,25 @@
+sequenceDiagram
+    participant S as MySQL SQL layer
+    participant H as ha_duckdb
+    participant A as BulkAppender / dml_convertor
+    participant T as ThdState (duckdb_xa)
+    participant K as DuckDB (schema file)
+
+    Note over S,H: INSERT (bulk)
+    S->>H: start_bulk_insert(rows)
+    H->>A: open Appender on table
+    loop each row
+        S->>H: write_row(buf)
+        H->>A: AppendRow(table) via AppendField per column
+    end
+    S->>H: end_bulk_insert()
+    H->>A: Flush()
+    H->>H: invalidate cached row count
+
+    Note over S,H: UPDATE / DELETE
+    S->>H: update_row(old,new) / delete_row(buf)
+    H->>T: txn_conn() (Begin once, RegisterTx)
+    H->>A: BuildPreparedUpdateSQL/DeleteSQL (once), Bind params
+    A->>K: prepared Execute (PK-located)
+    K-->>H: ok / duplicate-key / error
+    H->>H: invalidate cached row count

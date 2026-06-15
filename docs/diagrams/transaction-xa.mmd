@@ -1,0 +1,29 @@
+sequenceDiagram
+    participant C as Client
+    participant S as MySQL transaction coordinator
+    participant H as ha_duckdb / duckdb_xa
+    participant T as ThdState (per-THD connections)
+    participant K as DuckDB
+
+    C->>H: first DML/scan in statement
+    H->>T: Acquire(schema) + Begin (BEGIN TRANSACTION once)
+    H->>S: trans_register_ha (statement, and real txn if open)
+
+    alt COMMIT / autocommit statement end
+        C->>S: COMMIT
+        S->>H: Commit(thd, all)
+        H->>T: COMMIT on each connection
+        H->>H: ResetThdState (close connections)
+    else ROLLBACK
+        C->>S: ROLLBACK
+        S->>H: Rollback(thd, all)
+        H->>T: ROLLBACK on each connection
+    end
+
+    Note over S,H: XA two-phase
+    C->>S: XA PREPARE
+    S->>H: Prepare(thd, all)
+    H->>H: hand open connections to XID-keyed registry (not committed)
+    C->>S: XA COMMIT / XA ROLLBACK (any session)
+    S->>H: CommitByXid / RollbackByXid
+    H->>K: COMMIT / ROLLBACK on the prepared connections

@@ -1,0 +1,15 @@
+flowchart LR
+    subgraph mysql["MySQL schemas"]
+        s1["schema: shop"]
+        s2["schema: analytics"]
+    end
+    subgraph ctx["EngineContext registry"]
+        i1["DuckDB instance (shop)"]
+        i2["DuckDB instance (analytics)"]
+    end
+    subgraph dd["datadir"]
+        f1[("shop.duckdb")]
+        f2[("analytics.duckdb")]
+    end
+    s1 --> i1 --> f1
+    s2 --> i2 --> f2

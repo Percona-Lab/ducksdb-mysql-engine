@@ -1,0 +1,19 @@
+sequenceDiagram
+    participant S as MySQL SQL layer
+    participant H as ha_duckdb
+    participant SC as ScanCursor (duckdb_scan)
+    participant K as DuckDB (schema file)
+
+    S->>H: rnd_init(scan) / index_read_map(key, flag)
+    H->>H: build_projection() (read_set + PK)
+    opt index read
+        H->>H: WHERE from key parts + cond_push
+    end
+    H->>SC: Init(select_list, where, order)
+    SC->>K: SELECT ... (materialized: Query, not stream)
+    K-->>SC: result, first chunk (flattened)
+    loop each row
+        S->>H: rnd_next / index_next
+        H->>SC: Next(&chunk, &row)
+        H->>H: StoreFlatCell into record[0]
+    end

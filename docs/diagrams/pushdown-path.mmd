@@ -1,0 +1,34 @@
+sequenceDiagram
+    participant C as Client
+    participant J as JOIN::optimize() (server patch)
+    participant P as PushdownSelect (duckdb_pushdown)
+    participant B as BuildPushdownSQLBuilder
+    participant R as PlanRegistry (per-THD)
+    participant E as ExecutePushdown (override_executor_func)
+    participant K as DuckDB (schema file)
+    participant Q as Query_result
+
+    C->>J: SELECT ... FROM duckdb_tables ...
+    J->>P: pushdown_select(thd, join)
+    P->>B: BuildPushdownSQLBuilder(thd, join)
+    B->>B: gates (simple, grouped, no subquery/window/rollup)
+    B->>B: RenderFrom / RenderSelectItem / RenderPredicate / RenderAggregate / GROUP BY / ORDER BY / LIMIT
+    alt any node not translatable
+        B-->>P: false (DECLINE)
+        P-->>J: return false, override unset
+        J->>J: normal iterator execution (fallback)
+    else fully translatable
+        B-->>P: SQL + bound params + schema
+        P->>K: Connection(db).Prepare(sql)
+        P->>R: Put(thd, plan{conn, prepared})
+        P-->>J: set override_executor_func, return false
+        J->>E: run override executor
+        E->>R: Take(thd) -> plan
+        E->>K: prepared Execute(params)
+        K-->>E: materialized result (chunks)
+        E->>E: stage in temp table, StoreFlatCell per cell
+        loop each row
+            E->>Q: send_data(row)
+        end
+        E->>E: Ducksdb_pushdown_count += 1
+    end

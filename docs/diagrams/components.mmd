@@ -1,0 +1,39 @@
+flowchart TB
+    client["MySQL client / application"]
+
+    subgraph server["mysqld (MySQL 9.7 server)"]
+        sqllayer["SQL layer: parser / resolver / optimizer"]
+        joinopt["JOIN::optimize()<br/>(pushdown_select hook — server patch)"]
+        handlerapi["Handler API<br/>(open/close, rnd_*, index_*,<br/>write/update/delete_row, info)"]
+    end
+
+    subgraph engine["engine/ — DuckDB storage engine"]
+        ha["ha_duckdb<br/>(handler + handlerton registration)"]
+        pd["duckdb_pushdown<br/>(whole-query AST→SQL builder,<br/>ExecutePushdown, PlanRegistry)"]
+    end
+
+    subgraph common["common/ — shared bridge layer"]
+        ctx["EngineContext<br/>(per-schema DuckDB instance registry)"]
+        types["duckdb_types<br/>(MySQL ↔ DuckDB type mapping)"]
+        ddl["ddl_convertor"]
+        dml["dml_convertor"]
+        scan["duckdb_scan (ScanCursor)"]
+        appender["duckdb_appender (BulkAppender)"]
+        xa["duckdb_xa<br/>(per-THD connections, commit/rollback/XA)"]
+        cond["cond_pushdown<br/>(WHERE superset translation)"]
+        util["duckdb_sql_util<br/>(QuoteIdent / FieldLiteral)"]
+    end
+
+    subgraph duck["Embedded DuckDB (static library)"]
+        instr["DuckDB instances"]
+        files[("Per-schema files:<br/>shop.duckdb, analytics.duckdb, ...")]
+    end
+
+    client --> sqllayer --> joinopt
+    joinopt -->|"all base tables ENGINE=DuckDB"| pd
+    sqllayer --> handlerapi --> ha
+    ha --> ddl & dml & scan & appender & cond & util & xa & ctx
+    pd --> ctx & types
+    ha --> types
+    ctx --> instr --> files
+    xa --> instr
