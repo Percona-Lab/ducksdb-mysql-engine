@@ -1,0 +1,97 @@
+CREATE DATABASE pd;
+USE pd;
+CREATE TABLE sales (id INT PRIMARY KEY, d DATE,
+amount DECIMAL(12,2),
+name VARCHAR(32), category CHAR(1)) ENGINE=DuckDB;
+INSERT INTO sales VALUES
+(1,'2021-01-15',100.00,'foo','a'),
+(2,'2021-07-20',200.50,'foobar','a'),
+(3,'2022-03-10',300.25,'food','b'),
+(4,'2022-06-01',400.00,'bar','b'),
+(5,'2022-11-30',500.75,'baz','c'),
+(6,'2023-02-14',600.00,'fizz','a'),
+(7,'2023-09-09',700.10,'fog','c'),
+(8,'2020-12-31',800.00,'foe','b');
+#### DATE literal predicate -> pushed to DuckDB ####
+SELECT VARIABLE_VALUE INTO @p0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+SELECT category, COUNT(*) c, SUM(amount) tot
+FROM sales WHERE d <= DATE '2022-06-01' GROUP BY category ORDER BY category;
+category	c	tot
+a	2	300.50
+b	3	1500.25
+# pushdown engaged (counter +1):
+SELECT VARIABLE_VALUE-@p0 AS pushed FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+pushed
+1
+#### CAST('YYYY-MM-DD' AS DATE) predicate -> pushed ####
+SELECT VARIABLE_VALUE INTO @p1 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+SELECT category, COUNT(*) c
+FROM sales WHERE d <= CAST('2022-06-01' AS DATE) GROUP BY category ORDER BY category;
+category	c
+a	2
+b	3
+SELECT VARIABLE_VALUE-@p1 AS pushed FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+pushed
+1
+#### string-literal equality -> pushed ####
+SELECT VARIABLE_VALUE INTO @p2 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+SELECT COUNT(*) c, SUM(amount) tot FROM sales WHERE name = 'foo';
+c	tot
+1	100.00
+SELECT VARIABLE_VALUE-@p2 AS pushed FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+pushed
+1
+#### string IN-list -> pushed ####
+SELECT VARIABLE_VALUE INTO @p3 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+SELECT category, COUNT(*) c, SUM(amount) tot
+FROM sales WHERE category IN ('a','b') GROUP BY category ORDER BY category;
+category	c	tot
+a	3	900.50
+b	3	1500.25
+SELECT VARIABLE_VALUE-@p3 AS pushed FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+pushed
+1
+#### LIKE predicate -> pushed ####
+SELECT VARIABLE_VALUE INTO @p4 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+SELECT category, COUNT(*) c
+FROM sales WHERE name LIKE 'fo%' GROUP BY category ORDER BY category;
+category	c
+a	2
+b	2
+c	1
+SELECT VARIABLE_VALUE-@p4 AS pushed FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+pushed
+1
+#### CASE WHEN aggregate -> pushed ####
+SELECT VARIABLE_VALUE INTO @p5 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+SELECT SUM(CASE WHEN d >= DATE '2022-01-01' THEN amount ELSE 0 END) AS recent
+FROM sales;
+recent
+2501.10
+SELECT VARIABLE_VALUE-@p5 AS pushed FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+pushed
+1
+#### point/non-aggregate query -> NOT pushed (normal row path), still correct ####
+SELECT VARIABLE_VALUE INTO @p6 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+SELECT id, name, category FROM sales WHERE id=3;
+id	name	category
+3	food	b
+SELECT VARIABLE_VALUE-@p6 AS not_pushed FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+not_pushed
+0
+DROP TABLE sales;
+DROP DATABASE pd;

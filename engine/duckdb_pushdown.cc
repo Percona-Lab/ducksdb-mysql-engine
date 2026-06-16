@@ -120,6 +120,42 @@ bool ItemLiteralToValue(Item *it, duckdb::Value *out) {
     *out = duckdb::Value();  // untyped NULL; cast on bind
     return true;
   }
+  // Constant temporal values: a DATE literal, or a folded CAST(<lit> AS date) /
+  // any const expression whose resolved type is DATE/DATETIME/TIMESTAMP/TIME.
+  // These are NOT basic_const_item() (e.g. CAST is a function), so handle them
+  // before the basic-const gate. Safe because MySQL DATE/DATETIME literals are
+  // wall-clock (no timezone) and DuckDB DATE/TIMESTAMP/TIME are tz-naive: the
+  // item's canonical ISO string (val_str) casts unambiguously to the matching
+  // DuckDB temporal type. Any parse/range failure (e.g. a >24h or negative TIME
+  // that DuckDB TIME cannot hold) throws and we decline.
+  if (r->const_item() && r->is_temporal()) {
+    duckdb::LogicalType target = duckdb::LogicalType::SQLNULL;
+    switch (real_type_to_type(r->data_type())) {
+      case MYSQL_TYPE_DATE:
+      case MYSQL_TYPE_NEWDATE:
+        target = duckdb::LogicalType::DATE;
+        break;
+      case MYSQL_TYPE_DATETIME:
+      case MYSQL_TYPE_TIMESTAMP:
+        target = duckdb::LogicalType::TIMESTAMP;
+        break;
+      case MYSQL_TYPE_TIME:
+        target = duckdb::LogicalType::TIME;
+        break;
+      default:
+        return false;  // unsupported temporal flavor (e.g. YEAR): decline
+    }
+    String tmp;
+    String *s = r->val_str(&tmp);
+    if (s == nullptr || r->null_value) return false;
+    try {
+      *out =
+          duckdb::Value(std::string(s->ptr(), s->length())).DefaultCastAs(target);
+    } catch (const std::exception &) {
+      return false;
+    }
+    return true;
+  }
   if (!r->basic_const_item()) return false;
   switch (r->result_type()) {
     case INT_RESULT: {
@@ -144,10 +180,25 @@ bool ItemLiteralToValue(Item *it, duckdb::Value *out) {
       }
       return true;
     }
+    case STRING_RESULT: {
+      // Non-temporal string literal (temporal literals were handled above as
+      // typed DuckDB temporal Values). Bind the raw bytes as a DuckDB string.
+      // Comparison correctness against a column is governed by that column's
+      // COLLATE suffix from RenderField (unmappable collations already decline),
+      // so the literal value itself is exact — no escaping/charset divergence.
+      String tmp;
+      String *s = r->val_str(&tmp);
+      if (s == nullptr || r->null_value) return false;
+      try {
+        *out = duckdb::Value(std::string(s->ptr(), s->length()));
+      } catch (const std::exception &) {
+        return false;
+      }
+      return true;
+    }
     default:
-      // STRING/REAL/temporal literals: declined. REAL/DOUBLE risk ULP drift;
-      // string/temporal literals carry charset/parse ambiguity. The builder
-      // declines the whole query rather than emit a possibly-divergent value.
+      // REAL/DOUBLE literals: declined — float intermediary risks ULP drift, so
+      // the builder declines the whole query rather than emit a divergent value.
       return false;
   }
 }
@@ -214,7 +265,52 @@ bool RenderField(BuildCtx * /*ctx*/, Item *it, std::string *out) {
   return true;
 }
 
+// Bare qualified column reference: "table"."column" WITHOUT any COLLATE suffix,
+// plus the column's CollationMap. Used by LIKE, where DuckDB's COLLATE does NOT
+// affect LIKE/ILIKE matching, so the suffix must be omitted and case-sensitivity
+// chosen by operator (LIKE vs ILIKE) instead. Returns false if the item is not a
+// plain field. Non-string columns report kNone (byte/exact).
+bool RenderFieldBare(Item *it, std::string *out, CollationMap *cm_out) {
+  Item *r = it->real_item();
+  if (r == nullptr || r->type() != Item::FIELD_ITEM) return false;
+  const Item_field *f = down_cast<const Item_field *>(r);
+  if (f->field == nullptr) return false;
+  CollationMap cm = CollationMap::kNone;
+  if (f->field->result_type() == STRING_RESULT &&
+      !is_temporal_real_type(f->field->real_type())) {
+    cm = MapCollation(f->field->charset());
+  }
+  std::string col;
+  if (f->table_name != nullptr && f->table_name[0] != '\0')
+    col = QuoteIdent(f->table_name) + ".";
+  col += QuoteIdent(f->field_name != nullptr ? f->field_name : "");
+  *out = col;
+  if (cm_out != nullptr) *cm_out = cm;
+  return true;
+}
+
 bool RenderExpr(BuildCtx *ctx, Item *it, std::string *out);
+bool RenderPredicate(BuildCtx *ctx, Item *cond, std::string *out);
+bool RenderCase(BuildCtx *ctx, Item_func *fn, std::string *out);
+
+// LIKE-vs-ILIKE-vs-decline decision from a column's collation. Pure (no Item
+// access), so it is unit-tested in test_pushdown_builder.cc. DuckDB's LIKE is
+// always case-sensitive and COLLATE does not influence it, so:
+//   * kNoCase (MySQL _ai_ci, case-insensitive) → "ILIKE" (case-insensitive)
+//   * kNone   (_bin/binary, byte-exact)        → "LIKE"  (case-sensitive)
+//   * kDecline                                 → nullptr (decline)
+// Returns the DuckDB operator keyword, or nullptr to decline.
+const char *LikeOperatorFor(CollationMap cm) {
+  switch (cm) {
+    case CollationMap::kNoCase:
+      return "ILIKE";
+    case CollationMap::kNone:
+      return "LIKE";
+    case CollationMap::kDecline:
+    default:
+      return nullptr;
+  }
+}
 
 // Arithmetic over covered operands: (a OP b).
 bool RenderArith(BuildCtx *ctx, Item_func *fn, const char *op,
@@ -292,6 +388,19 @@ bool RenderExpr(BuildCtx *ctx, Item *it, std::string *out) {
   if (it == nullptr) return false;
   Item *r = it->real_item();
   if (r == nullptr) return false;  // Item_ref/Item_cache not unwrappable
+  // Constants bind as $N params via ItemLiteralToValue — try this FIRST so a
+  // constant that is a FUNC_ITEM (e.g. CAST('1998-09-02' AS date)) or a
+  // string/temporal literal is bound rather than falling into the structural
+  // switch below (which only knows fields, aggregates, +-*/, CASE). A const we
+  // cannot bind (REAL, or const arithmetic like 1+1) declines here without
+  // pushing a param and falls through to structural rendering.
+  if (r->const_item()) {
+    std::string lit;
+    if (RenderLiteral(ctx, r, &lit)) {
+      *out = std::move(lit);
+      return true;
+    }
+  }
   switch (r->type()) {
     case Item::FIELD_ITEM:
       return RenderField(ctx, r, out);
@@ -312,6 +421,8 @@ bool RenderExpr(BuildCtx *ctx, Item *it, std::string *out) {
           return RenderArith(ctx, fn, "*", out);
         case Item_func::DIV_FUNC:
           return RenderArith(ctx, fn, "/", out);
+        case Item_func::CASE_FUNC:
+          return RenderCase(ctx, fn, out);
         default:
           return false;  // non-whitelisted scalar function: decline
       }
@@ -372,6 +483,11 @@ bool RenderIn(BuildCtx *ctx, Item_func *fn, std::string *out) {
   auto *in = down_cast<Item_func_in *>(fn);
   if (in->negated) return false;  // NOT IN: decline
   if (fn->argument_count() < 2) return false;
+  // String literals now flow through RenderLiteral (STRING_RESULT). The IN
+  // column carries its COLLATE suffix from RenderField; unlike LIKE, DuckDB DOES
+  // apply COLLATE to equality/IN comparisons, so a _ai_ci column's IN-list stays
+  // case-insensitive. (Confirmed by the duckdb-suite integration test; if a
+  // future DuckDB drops COLLATE on IN, this must move to ILIKE-style handling.)
   std::string col;
   if (!RenderExpr(ctx, fn->arguments()[0], &col)) return false;
   std::string vals;
@@ -383,6 +499,53 @@ bool RenderIn(BuildCtx *ctx, Item_func *fn, std::string *out) {
   }
   if (vals.empty()) return false;
   *out = "(" + col + " IN (" + vals + "))";
+  return true;
+}
+
+// col LIKE pattern. DuckDB LIKE is case-sensitive and unaffected by COLLATE, so
+// the case-sensitivity must come from the operator: a _ai_ci column → ILIKE, a
+// _bin/binary column → LIKE, anything else declines (see LikeOperatorFor). The
+// left operand must be a plain field (so we know its collation); the right must
+// be a string literal. Declines: a pattern containing '\\' (DuckDB and MySQL
+// differ on backslash escaping), and NOT LIKE (it arrives wrapped in NOT_FUNC,
+// which the predicate switch already declines, so this helper only sees bare
+// LIKE). ESCAPE clauses also decline.
+bool RenderLike(BuildCtx *ctx, Item_func *fn, std::string *out) {
+  auto *like = down_cast<Item_func_like *>(fn);
+  if (like->escape_was_used_in_parsing()) return false;  // explicit ESCAPE: decline
+  if (fn->argument_count() != 2) return false;
+  // Left operand: a field whose collation chooses LIKE vs ILIKE.
+  std::string col;
+  CollationMap cm = CollationMap::kDecline;
+  if (!RenderFieldBare(fn->arguments()[0], &col, &cm)) return false;
+  // Only string columns: MySQL LIKE on a numeric/temporal column implicitly
+  // casts the column to a string first, and DuckDB's implicit cast can differ —
+  // so restrict to genuine string fields (RenderFieldBare reports kNone for any
+  // non-string field, which would otherwise pick plain LIKE). Decline otherwise.
+  {
+    const Item_field *lf =
+        down_cast<const Item_field *>(fn->arguments()[0]->real_item());
+    if (lf->field == nullptr ||
+        lf->field->result_type() != STRING_RESULT ||
+        is_temporal_real_type(lf->field->real_type()))
+      return false;
+  }
+  const char *op = LikeOperatorFor(cm);
+  if (op == nullptr) return false;
+  // Right operand: a string literal. Inspect its raw bytes for a backslash
+  // BEFORE binding — DuckDB treats '\\' in LIKE as the default escape character
+  // while MySQL's default escape is also '\\', but the two diverge on edge cases
+  // (e.g. trailing escape), so we conservatively decline any pattern with '\\'.
+  Item *pat = fn->arguments()[1]->real_item();
+  if (pat == nullptr || pat->result_type() != STRING_RESULT) return false;
+  if (!pat->const_item() || pat->is_temporal()) return false;
+  String tmp;
+  String *s = pat->val_str(&tmp);
+  if (s == nullptr || pat->null_value) return false;
+  if (memchr(s->ptr(), '\\', s->length()) != nullptr) return false;
+  std::string lit;
+  if (!RenderLiteral(ctx, fn->arguments()[1], &lit)) return false;
+  *out = "(" + col + " " + op + " " + lit + ")";
   return true;
 }
 
@@ -466,6 +629,8 @@ bool RenderPredicate(BuildCtx *ctx, Item *cond, std::string *out) {
         return RenderBetween(ctx, fn, out);
       case Item_func::IN_FUNC:
         return RenderIn(ctx, fn, out);
+      case Item_func::LIKE_FUNC:
+        return RenderLike(ctx, fn, out);
       case Item_func::ISNULL_FUNC:
         return RenderNullTest(ctx, fn, true, out);
       case Item_func::ISNOTNULL_FUNC:
@@ -479,8 +644,60 @@ bool RenderPredicate(BuildCtx *ctx, Item *cond, std::string *out) {
   return false;
 }
 
+// Searched CASE: CASE WHEN <pred1> THEN <expr1> ... [ELSE <exprN>] END.
+//
+// Item_func_case argument layout (see Item_func_case::print): args[0..ncases) are
+// WHEN/THEN pairs (args[2k]=WHEN predicate, args[2k+1]=THEN value); a simple-CASE
+// operand, when present, sits at get_first_expr_num(); the ELSE value, when
+// present, sits at get_else_expr_num(). We render only the SEARCHED form (no
+// simple-CASE operand) — DuckDB CASE is SQL-standard so the searched form matches
+// exactly. Each WHEN renders via RenderPredicate, each THEN/ELSE via RenderExpr;
+// any sub-decline declines the whole CASE.
+bool RenderCase(BuildCtx *ctx, Item_func *fn, std::string *out) {
+  auto *c = down_cast<Item_func_case *>(fn);
+  // Simple CASE (CASE <operand> WHEN ...) is out of scope: its WHEN arms are
+  // value comparisons against the operand, not predicates. Decline.
+  if (c->get_first_expr_num() != -1) return false;
+  const int else_num = c->get_else_expr_num();
+  const uint argc = fn->argument_count();
+  // For searched CASE the ELSE (if any) is the last argument; the WHEN/THEN pairs
+  // fill [0, ncases). ncases is even.
+  uint ncases = argc;
+  if (else_num != -1) {
+    if (static_cast<uint>(else_num) != argc - 1) return false;  // unexpected shape
+    ncases = argc - 1;
+  }
+  if (ncases == 0 || (ncases % 2) != 0) return false;
+  std::string body = "CASE";
+  for (uint i = 0; i < ncases; i += 2) {
+    std::string when_sql, then_sql;
+    if (!RenderPredicate(ctx, fn->arguments()[i], &when_sql)) return false;
+    if (!RenderExpr(ctx, fn->arguments()[i + 1], &then_sql)) return false;
+    body += " WHEN " + when_sql + " THEN " + then_sql;
+  }
+  if (else_num != -1) {
+    std::string else_sql;
+    if (!RenderExpr(ctx, fn->arguments()[else_num], &else_sql)) return false;
+    body += " ELSE " + else_sql;
+  }
+  body += " END";
+  *out = "(" + body + ")";
+  return true;
+}
+
 // Render one SELECT-list item with its optional alias.
 bool RenderSelectItem(BuildCtx *ctx, Item *it, std::string *out) {
+  // Post-aggregation arithmetic in the SELECT list — an expression *over*
+  // aggregates such as `100*sum(x)/sum(y)` — is rendered correctly but the
+  // result-staging path (ExecutePushdown wrapping each temp-table field in an
+  // Item_field) faults on the computed column. Until that is reworked, decline
+  // any visible item that aggregates but is not itself a bare aggregate, so the
+  // query falls back to normal MySQL execution rather than pushing a plan that
+  // would crash. A bare aggregate (SUM/AVG/COUNT/...) stages fine.
+  if (it->has_aggregation()) {
+    Item *r = it->real_item();
+    if (r == nullptr || r->type() != Item::SUM_FUNC_ITEM) return false;
+  }
   std::string expr;
   if (!RenderExpr(ctx, it, &expr)) return false;
   // Preserve the visible column alias so the result column names match what the
@@ -594,18 +811,36 @@ bool BuildPushdownSQLBuilder(const THD *thd, JOIN *join, std::string *db_out,
     sql += " WHERE " + where_sql;
   }
 
-  // GROUP BY.
+  // GROUP BY. DuckDB requires EVERY non-aggregated SELECT column to appear in
+  // GROUP BY; MySQL relaxes this via functional dependency and its optimizer may
+  // have PRUNED FD-determined columns out of group_list. So emit the UNION of the
+  // (possibly pruned) group_list and every non-aggregate visible SELECT column.
+  // This is semantically identical — the pruned columns are single-valued within
+  // each group, so adding them creates no new groups — and is valid for DuckDB.
   if (qb->group_list.elements > 0) {
-    std::string group_sql;
-    bool gfirst = true;
+    std::vector<std::string> keys;
+    auto add_key = [&keys](const std::string &s) {
+      for (const auto &k : keys)
+        if (k == s) return;
+      keys.push_back(s);
+    };
     for (ORDER *g = qb->group_list.first; g != nullptr; g = g->next) {
       std::string g_sql;
       if (!RenderExpr(&ctx, *g->item, &g_sql)) return decline("group");
-      if (!gfirst) group_sql += ", ";
-      group_sql += g_sql;
-      gfirst = false;
+      add_key(g_sql);
     }
-    if (!gfirst) sql += " GROUP BY " + group_sql;
+    for (Item *it : qb->visible_fields()) {
+      if (it->has_aggregation()) continue;  // aggregates are not group keys
+      std::string s_sql;
+      if (!RenderExpr(&ctx, it, &s_sql)) return decline("group-select");
+      add_key(s_sql);
+    }
+    std::string group_sql;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (i) group_sql += ", ";
+      group_sql += keys[i];
+    }
+    if (!keys.empty()) sql += " GROUP BY " + group_sql;
   }
 
   // HAVING.

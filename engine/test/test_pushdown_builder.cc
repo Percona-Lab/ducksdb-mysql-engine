@@ -66,6 +66,37 @@ std::string CollateSuffix(CollationMap m) {
   }
 }
 
+// Keep this in sync with LikeOperatorFor in engine/duckdb_pushdown.cc. Returns
+// the DuckDB LIKE operator a column's collation maps to, or nullptr to decline.
+// DuckDB LIKE is case-sensitive and COLLATE does not affect it, so the operator
+// itself must carry the case-sensitivity: _ai_ci → ILIKE, _bin/binary → LIKE.
+const char *LikeOperatorFor(CollationMap cm) {
+  switch (cm) {
+    case CollationMap::kNoCase:
+      return "ILIKE";
+    case CollationMap::kNone:
+      return "LIKE";
+    case CollationMap::kDecline:
+    default:
+      return nullptr;
+  }
+}
+
+// Models RenderCase's shape arithmetic over Item_func_case's argument layout
+// (args[0..ncases) are WHEN/THEN pairs; ELSE, when present, is the last arg).
+// Returns true if a searched CASE of this shape would render, false to decline.
+// Keep in sync with RenderCase in engine/duckdb_pushdown.cc.
+bool CaseShapeRenders(int first_expr_num, int else_num, unsigned argc) {
+  if (first_expr_num != -1) return false;  // simple CASE: decline
+  unsigned ncases = argc;
+  if (else_num != -1) {
+    if (static_cast<unsigned>(else_num) != argc - 1) return false;
+    ncases = argc - 1;
+  }
+  if (ncases == 0 || (ncases % 2) != 0) return false;
+  return true;
+}
+
 // ===========================================================================
 // Collation mapping
 // ===========================================================================
@@ -115,6 +146,76 @@ TEST(MapCollation, UnknownCollationDeclines) {
 TEST(CollateSuffix, DeclineAndNoneEmitNothing) {
   EXPECT_EQ("", CollateSuffix(CollationMap::kDecline));
   EXPECT_EQ("", CollateSuffix(CollationMap::kNone));
+}
+
+// ===========================================================================
+// LIKE → operator decision.
+//
+// The builder cannot rely on COLLATE for LIKE (DuckDB ignores it), so the
+// collation-to-operator mapping is the whole correctness gate for LIKE pushdown.
+// ===========================================================================
+
+// A case-insensitive (_ai_ci) column must use ILIKE so DuckDB matches the
+// case-insensitive MySQL semantics.
+TEST(LikeOperator, NoCaseUsesILike) {
+  EXPECT_STREQ("ILIKE", LikeOperatorFor(CollationMap::kNoCase));
+}
+
+// A byte-exact (_bin/binary) column uses plain case-sensitive LIKE.
+TEST(LikeOperator, ByteExactUsesLike) {
+  EXPECT_STREQ("LIKE", LikeOperatorFor(CollationMap::kNone));
+}
+
+// An unmappable collation declines (nullptr) rather than risk a case mismatch.
+TEST(LikeOperator, DeclineCollationDeclines) {
+  EXPECT_EQ(nullptr, LikeOperatorFor(CollationMap::kDecline));
+}
+
+// End-to-end of the mapping: the default 8.0 collation pushes LIKE as ILIKE,
+// utf8mb4_bin as LIKE, and a case-sensitive collation declines entirely.
+TEST(LikeOperator, ComposesWithMapCollation) {
+  EXPECT_STREQ("ILIKE",
+               LikeOperatorFor(MapCollation(0, "utf8mb4_0900_ai_ci")));
+  EXPECT_STREQ("LIKE",
+               LikeOperatorFor(MapCollation(MY_CS_BINSORT, "utf8mb4_bin")));
+  EXPECT_EQ(nullptr,
+            LikeOperatorFor(MapCollation(MY_CS_CSSORT, "utf8mb4_0900_as_cs")));
+}
+
+// ===========================================================================
+// Searched-CASE shape arithmetic.
+// ===========================================================================
+
+// CASE WHEN p THEN v END — one WHEN/THEN pair, no ELSE.
+TEST(CaseShape, SingleWhenNoElseRenders) {
+  EXPECT_TRUE(CaseShapeRenders(/*first_expr_num=*/-1, /*else_num=*/-1,
+                               /*argc=*/2));
+}
+
+// CASE WHEN p THEN v ELSE e END — pair + trailing ELSE (else_num == argc-1).
+TEST(CaseShape, WhenWithElseRenders) {
+  EXPECT_TRUE(CaseShapeRenders(-1, /*else_num=*/2, /*argc=*/3));
+}
+
+// Two WHEN/THEN pairs plus ELSE.
+TEST(CaseShape, MultipleWhensWithElseRenders) {
+  EXPECT_TRUE(CaseShapeRenders(-1, /*else_num=*/4, /*argc=*/5));
+}
+
+// Simple CASE (CASE <operand> WHEN ...) — first_expr_num set — declines.
+TEST(CaseShape, SimpleCaseDeclines) {
+  EXPECT_FALSE(CaseShapeRenders(/*first_expr_num=*/2, /*else_num=*/-1,
+                                /*argc=*/3));
+}
+
+// Degenerate: no WHEN/THEN pairs at all declines.
+TEST(CaseShape, NoBranchesDeclines) {
+  EXPECT_FALSE(CaseShapeRenders(-1, -1, /*argc=*/0));
+}
+
+// An odd number of WHEN-region args (a THEN missing its WHEN) declines.
+TEST(CaseShape, OddPairCountDeclines) {
+  EXPECT_FALSE(CaseShapeRenders(-1, -1, /*argc=*/3));
 }
 
 // ===========================================================================
@@ -207,6 +308,17 @@ TEST(ItemLiteralToValue, RealLiteralDeclines) {
   duckdb::Value v;
   // REAL/DOUBLE literals are declined (ULP risk).
   EXPECT_FALSE(ducksdb_mysql::ItemLiteralToValue(&f, &v));
+}
+
+// A (non-temporal) string literal binds as a DuckDB VARCHAR carrying the exact
+// bytes. Comparison case-sensitivity is the column's COLLATE concern, not the
+// literal's, so the value itself round-trips verbatim.
+TEST(ItemLiteralToValue, StringLiteralRoundTrips) {
+  Item_string s("hello", 5, &my_charset_bin);
+  duckdb::Value v;
+  ASSERT_TRUE(ducksdb_mysql::ItemLiteralToValue(&s, &v));
+  EXPECT_EQ("hello",
+            v.DefaultCastAs(duckdb::LogicalType::VARCHAR).GetValue<std::string>());
 }
 
 }  // namespace
