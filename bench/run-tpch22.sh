@@ -63,6 +63,7 @@ DUCKDB_IMAGE="ducksdb-duckdb:$DUCKDB_VERSION"
 INNODB_POOL=${INNODB_POOL:-2G}
 QTIMEOUT=${QTIMEOUT:-300}
 ONLY=${ONLY:-}
+SKIP_INNODB=${SKIP_INNODB:-0}   # 1 = engine + native DuckDB only (skip the slow InnoDB leg)
 
 DATA="$HERE/data-sf$SF"; mkdir -p "$DATA"
 QDIR="$DATA/queries"      # extracted/translated query text (cached)
@@ -222,11 +223,15 @@ mysql_load(){ # $1=database $2=engine — create the 8 tables and LOAD the CSVs
   done
 }
 
-log "loading InnoDB (db: tpch_innodb) ..."
-mysql_load tpch_innodb InnoDB
+if [ "$SKIP_INNODB" != 1 ]; then
+  log "loading InnoDB (db: tpch_innodb) ..."
+  mysql_load tpch_innodb InnoDB
+else
+  log "SKIP_INNODB=1: skipping the InnoDB leg (engine + native DuckDB only)"
+fi
 log "loading ENGINE=DuckDB (db: tpch_engine) ..."
 mysql_load tpch_engine DuckDB
-log "rows: innodb.lineitem=$(docker exec "$DB" mysql -uroot -N -B tpch_innodb -e 'SELECT COUNT(*) FROM lineitem' 2>/dev/null)  engine.lineitem=$(docker exec "$DB" mysql -uroot -N -B tpch_engine -e 'SELECT COUNT(*) FROM lineitem' 2>/dev/null)"
+log "rows: engine.lineitem=$(docker exec "$DB" mysql -uroot -N -B tpch_engine -e 'SELECT COUNT(*) FROM lineitem' 2>/dev/null)"
 
 # -----------------------------------------------------------------------------
 # 5. Native DuckDB: load CSVs into a local .duckdb file for the native leg.
@@ -246,7 +251,7 @@ docker exec "$DK" rm -f /data/native.duckdb 2>/dev/null || true
 # Offload counter delta — same global status var the plugin exposes; the in-tree
 # engine is assumed to expose it too. A positive delta == the query ran in DuckDB.
 ocount(){ docker exec "$DB" mysql -uroot -N -B -e \
-  "SHOW GLOBAL STATUS LIKE 'Ducksdb_secondary_offload_count'" 2>/dev/null | awk '{print $2}'; }
+  "SHOW GLOBAL STATUS LIKE 'Ducksdb_pushdown_count'" 2>/dev/null | awk '{print $2}'; }
 
 # Order-independent checksum of a result set: sort rows, md5. Tab-separated,
 # NULLs normalized, so InnoDB vs engine compare cleanly regardless of row order.
@@ -305,12 +310,16 @@ for n in $QNUMS; do
   # --- native DuckDB (always attempted; verbatim dialect) ---
   nat=$(time_duckdb "$duck_sql"); nat=${nat:-ERR}
 
-  # --- InnoDB (correctness oracle) ---
-  ii=$(time_mysql tpch_innodb "$mysql_sql")
-  if [ -z "$ii" ]; then
-    # MySQL couldn't run the translated query -> skip BOTH MySQL legs, keep native.
-    printf '%-5s %10s %10s %12s %-10s %-7s\n' "Q$n" "SKIP" "SKIP" "$nat" "—" "—" | tee -a "$SUMMARY"
-    n_skip=$((n_skip+1)); continue
+  # --- InnoDB (correctness oracle; skipped when SKIP_INNODB=1) ---
+  if [ "$SKIP_INNODB" = 1 ]; then
+    ii="—"
+  else
+    ii=$(time_mysql tpch_innodb "$mysql_sql")
+    if [ -z "$ii" ]; then
+      # MySQL couldn't run the translated query -> skip BOTH MySQL legs, keep native.
+      printf '%-5s %10s %10s %12s %-10s %-7s\n' "Q$n" "SKIP" "SKIP" "$nat" "—" "—" | tee -a "$SUMMARY"
+      n_skip=$((n_skip+1)); continue
+    fi
   fi
 
   # --- engine (auto-offload; bracket with offload counter) ---
@@ -323,14 +332,18 @@ for n in $QNUMS; do
   fi
   off=no; [ -n "$c0" ] && [ -n "$c1" ] && [ "$((c1 - c0))" -gt 0 ] && off=yes
 
-  # --- correctness: engine result vs InnoDB result ---
-  cs_i=$(checksum_mysql tpch_innodb "$mysql_sql")
-  cs_e=$(checksum_mysql tpch_engine "$mysql_sql")
-  if [ -n "$cs_i" ] && [ "$cs_i" = "$cs_e" ]; then
-    match=yes; n_ok=$((n_ok+1))
+  # --- correctness: engine result vs InnoDB result (no oracle when SKIP_INNODB) ---
+  if [ "$SKIP_INNODB" = 1 ]; then
+    match="—"; n_ok=$((n_ok+1))
   else
-    match=NO; n_mismatch=$((n_mismatch+1))
-    echo "Q$n MISMATCH innodb=$cs_i engine=$cs_e" >> "$OUT/mismatch.log"
+    cs_i=$(checksum_mysql tpch_innodb "$mysql_sql")
+    cs_e=$(checksum_mysql tpch_engine "$mysql_sql")
+    if [ -n "$cs_i" ] && [ "$cs_i" = "$cs_e" ]; then
+      match=yes; n_ok=$((n_ok+1))
+    else
+      match=NO; n_mismatch=$((n_mismatch+1))
+      echo "Q$n MISMATCH innodb=$cs_i engine=$cs_e" >> "$OUT/mismatch.log"
+    fi
   fi
 
   printf '%-5s %10s %10s %12s %-10s %-7s\n' "Q$n" "$ii" "$ee" "$nat" "$off" "$match" | tee -a "$SUMMARY"
@@ -343,7 +356,7 @@ done
   echo
   echo "[t22] passed(match)=$n_ok  mismatch=$n_mismatch  skipped=$n_skip   of 22"
   echo "[t22] times are min wall-clock over $ITERS iters (1 warmup, excl.)."
-  echo "[t22] 'offloaded?=yes' = Ducksdb_secondary_offload_count rose => query ran in DuckDB."
+  echo "[t22] 'offloaded?=yes' = Ducksdb_pushdown_count rose => query ran in DuckDB."
   echo "[t22] 'match?' compares an order-independent md5 of the engine vs InnoDB result set."
   echo "[t22] SKIP = the DuckDB-dialect query did not run on MySQL after translation"
   echo "      (see $QDIR/qNN.mysql.sql to hand-fix); native DuckDB still timed it."
