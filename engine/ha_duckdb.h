@@ -41,6 +41,15 @@ public:
     ha_duckdb(handlerton *hton, TABLE_SHARE *table_arg);
     ~ha_duckdb() override;
 
+    // Bulk-load fast-path entry point, dispatched from the handlerton load_into
+    // hook: ingest a server-side CSV directly via DuckDB COPY instead of the
+    // row-by-row write path. Sets *handled=true if it ran the load (then
+    // *rows_loaded holds the count); returns true only on a real error. Leaves
+    // *handled=false (returning false) to fall back to write_row.
+    bool load_data_fast(const char *file_path, const class sql_exchange *ex,
+                        int dup, bool ignore, ulonglong *rows_loaded,
+                        bool *handled);
+
     const char *table_type() const override { return "DuckDB"; }
     ulonglong table_flags() const override {
         return HA_NULL_IN_KEY | HA_CAN_INDEX_BLOBS |

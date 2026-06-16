@@ -4,11 +4,15 @@
 #include "ha_duckdb.h"
 
 #include <mysql/plugin.h>
-#include <new>  // std::nothrow
+#include <cstring>  // std::strlen
+#include <new>      // std::nothrow
 #include <string>
 #include "mysqld_error.h"
 #include "sql/handler.h"
 #include "sql/key.h"  // key_restore
+#include "sql/sql_class.h"     // THD
+#include "sql/sql_exchange.h"  // sql_exchange (LOAD DATA format)
+#include "sql_string.h"        // String
 
 #include "cond_pushdown.h"
 #include "ddl_convertor.h"
@@ -166,6 +170,91 @@ int ha_duckdb::end_bulk_insert() {
     bulk_.reset();
     if (rc == 0) invalidate_row_count();  // bulk rows landed: cached count stale
     return rc;
+}
+
+namespace {
+// Single-quote a string for a DuckDB SQL literal (double embedded quotes).
+std::string SqlLiteral(const char *s, size_t n) {
+    std::string out = "'";
+    for (size_t i = 0; i < n; ++i) {
+        if (s[i] == '\'') out += '\'';
+        out += s[i];
+    }
+    out += '\'';
+    return out;
+}
+// True iff the optional String is exactly the single byte c.
+bool IsByte(const String *s, char c) {
+    return s != nullptr && s->length() == 1 && s->ptr()[0] == c;
+}
+// True iff the optional String is empty/absent.
+bool IsEmpty(const String *s) { return s == nullptr || s->length() == 0; }
+}  // namespace
+
+bool ha_duckdb::load_data_fast(const char *file_path, const sql_exchange *ex,
+                               int dup, bool ignore, ulonglong *rows_loaded,
+                               bool *handled) {
+    *handled = false;
+    if (ex == nullptr || file_path == nullptr) return false;  // fall back
+
+    // Only the cleanly, provably-equivalent CSV profile pushes to COPY; anything
+    // else falls back to the row path (handled stays false). We require: a
+    // single-byte field terminator, a '\n' (or default) line terminator, no
+    // LINES STARTING BY, no enclosure (DuckDB would treat '"' specially), the
+    // default '\' (or no) escape, and plain INSERT semantics (no REPLACE/IGNORE).
+    const String *fterm = ex->field.field_term;
+    const String *encl = ex->field.enclosed;
+    const String *esc = ex->field.escaped;
+    const String *lterm = ex->line.line_term;
+    const String *lstart = ex->line.line_start;
+    if (fterm == nullptr || fterm->length() != 1) return false;
+    if (!IsEmpty(lstart)) return false;                       // LINES STARTING BY
+    if (!(IsEmpty(lterm) || IsByte(lterm, '\n'))) return false;
+    if (!IsEmpty(encl)) return false;                         // ENCLOSED BY
+    if (!(IsEmpty(esc) || IsByte(esc, '\\'))) return false;   // non-default escape
+    if (dup == DUP_REPLACE || ignore) return false;          // dup handling differs
+
+    std::string sql =
+        "COPY " + ducksdb_mysql::QuoteIdent(table_name_) + " FROM " +
+        SqlLiteral(file_path, std::strlen(file_path)) +
+        " (FORMAT csv, HEADER false, AUTO_DETECT false, DELIMITER " +
+        SqlLiteral(fterm->ptr(), 1) + ", QUOTE '', ESCAPE '', NULL '\\N'";
+    if (ex->skip_lines > 0) sql += ", SKIP " + std::to_string(ex->skip_lines);
+    sql += ")";
+
+    // From here we own the load: any failure is reported as an error (handled),
+    // not a silent fallback, because COPY runs in the statement transaction.
+    *handled = true;
+    try {
+        duckdb::Connection &conn = txn_conn();
+        auto r = conn.Query(sql);
+        if (r->HasError()) {
+            my_error(ER_GET_ERRMSG, MYF(0), 0, r->GetError().c_str(), "DuckDB");
+            return true;
+        }
+        ulonglong n = 0;
+        if (r->RowCount() >= 1) {
+            auto v = r->GetValue(0, 0);
+            if (!v.IsNull()) n = static_cast<ulonglong>(v.GetValue<int64_t>());
+        }
+        *rows_loaded = n;
+        invalidate_row_count();
+        return false;
+    } catch (const std::exception &e) {
+        my_error(ER_GET_ERRMSG, MYF(0), 0, e.what(), "DuckDB");
+        return true;
+    }
+}
+
+// Handlerton load_into hook: dispatch to the (DuckDB) handler of the target
+// table. Only called by the server for a single ENGINE=DuckDB table.
+static bool ducksdb_load_into(THD * /*thd*/, TABLE *table, const char *file_path,
+                              const sql_exchange *ex, int dup, bool ignore,
+                              ulonglong *rows_loaded, bool *handled) {
+    *handled = false;
+    if (table == nullptr || table->file == nullptr) return false;
+    auto *h = static_cast<ha_duckdb *>(table->file);
+    return h->load_data_fast(file_path, ex, dup, ignore, rows_loaded, handled);
 }
 
 ha_rows ha_duckdb::duckdb_row_count() {
@@ -582,6 +671,7 @@ static int ducksdb_init_func(void *p) {
     // all ENGINE=DuckDB, run it inside DuckDB and stream the result back. Invoked
     // by the server hook added in sql/sql_optimizer.cc (JOIN::optimize tail).
     ducksdb_hton->pushdown_select = ducksdb_mysql::PushdownSelect;
+    ducksdb_hton->load_into = ducksdb_load_into;
     return 0;
 }
 

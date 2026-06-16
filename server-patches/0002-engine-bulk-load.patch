@@ -1,0 +1,138 @@
+--- a/sql/handler.h
++++ b/sql/handler.h
+@@ -2403,8 +2403,8 @@
+ 
+ /**
+   Hook for a primary storage engine to take over execution of an entire SELECT
+-  whose base tables all belong to that engine — a whole-query
+-  pushdown. Called at the end of JOIN::optimize();
++  whose base tables all belong to that engine — a select_handler-style whole-query
++  pushdown (cf. MariaDB's select_handler). Called at the end of JOIN::optimize();
+   the engine inspects the optimized JOIN and may set JOIN::override_executor_func
+   to run the query itself, returning false. Returning without setting it (and
+   returning false) leaves normal iterator execution in place (transparent
+@@ -2416,6 +2416,33 @@
+ */
+ using pushdown_select_t = bool (*)(THD *thd, JOIN *join);
+ 
++class sql_exchange;
++
++/**
++  Hook for a primary storage engine to take over a whole LOAD DATA into one of
++  its tables by ingesting the server-side source file directly (e.g. a DuckDB
++  COPY) instead of the row-by-row handler::write_row path. Called from
++  Sql_cmd_load_table::execute_inner() before the read loop, only for a non-LOCAL
++  file with identity column mapping and no SET clauses. The engine sets
++  *handled=true if it ran the load (then *rows_loaded holds the row count) and
++  returns true only on a real error. Leaving *handled=false (and returning
++  false) falls back to the normal row path transparently.
++
++  @param thd          thread context
++  @param table        target TABLE (single, all columns, this engine)
++  @param file_path    resolved, secure-file-priv-checked server file path
++  @param ex           LOAD DATA format (terminators/enclose/escape/skip/charset)
++  @param dup          duplicate-key handling (enum_duplicates as int; the enum is
++                      not yet declared at this point in the header)
++  @param ignore       IGNORE was given
++  @param rows_loaded  out: rows ingested when handled
++  @param handled      out: true iff the engine ran the load
++  @return true on error, false otherwise
++*/
++using load_into_t = bool (*)(THD *thd, TABLE *table, const char *file_path,
++                             const sql_exchange *ex, int dup, bool ignore,
++                             ulonglong *rows_loaded, bool *handled);
++
+ /**
+   Compares the cost of two join plans in the secondary storage engine. The cost
+   of the current candidate is compared with the cost of the best plan seen so
+@@ -3065,7 +3092,7 @@
+   optimize_secondary_engine_t optimize_secondary_engine;
+ 
+   /**
+-    Optional whole-query pushdown hook: take over execution of a whole SELECT
++    Optional select_handler-style hook: take over execution of a whole SELECT
+     whose base tables all belong to this (primary) engine. Called at the end of
+     JOIN::optimize() when every base table is this engine. Defaults to nullptr
+     (handlerton is zero-filled at allocation). @see pushdown_select_t.
+@@ -3073,6 +3100,14 @@
+   pushdown_select_t pushdown_select;
+ 
+   /**
++    Optional bulk-load fast-path: ingest a server-side LOAD DATA source file
++    directly into one of this engine's tables (e.g. DuckDB COPY) instead of the
++    row-by-row write path. Defaults to nullptr (handlerton is zero-filled).
++    @see load_into_t.
++  */
++  load_into_t load_into;
++
++  /**
+     Pointer to a function that estimates the cost of executing a join in a
+     secondary storage engine.
+ 
+--- a/sql/sql_load.cc
++++ b/sql/sql_load.cc
+@@ -860,6 +860,25 @@
+ }
+ 
+ /**
++  True iff the LOAD DATA field list is the table's full column set in natural
++  order (no column list given, or an explicit identity list) with no user
++  variables — i.e. CSV field i maps to table column i. Required for the engine
++  bulk-load fast-path, which ingests the file positionally.
++*/
++static bool ducksdb_is_identity_field_list(const mem_root_deque<Item *> &fields,
++                                           const TABLE *table) {
++  if (fields.size() != table->s->fields) return false;
++  uint i = 0;
++  for (Item *it : fields) {
++    if (it == nullptr || it->type() != Item::FIELD_ITEM) return false;
++    const Field *f = down_cast<const Item_field *>(it)->field;
++    if (f == nullptr || f->field_index() != i) return false;
++    ++i;
++  }
++  return true;
++}
++
++/**
+   Execute LOAD DATA query
+ 
+   @param thd                 Current thread.
+@@ -1211,6 +1230,38 @@
+       return true;
+   }
+ 
++  // --- Engine bulk-load fast-path ------------------------------------------
++  // Let a primary engine (e.g. ENGINE=DuckDB) ingest the server-side source file
++  // directly (DuckDB COPY) instead of the row-by-row write loop. Restricted to
++  // the cleanly-translatable case: non-LOCAL file, identity column mapping, no
++  // SET clauses, no triggers, no binlog. Anything else falls through unchanged.
++  if (!m_is_local_file && file >= 0 && !mysql_bin_log.is_open() &&
++      m_opt_set_fields.empty() &&
++      ducksdb_is_identity_field_list(m_opt_fields_or_vars, table) &&
++      table->triggers == nullptr && table->s->db_type() != nullptr &&
++      table->s->db_type()->load_into != nullptr) {
++    bool handled = false;
++    ulonglong rows_loaded = 0;
++    const bool ld_err = table->s->db_type()->load_into(
++        thd, table, name, &m_exchange, handle_duplicates, thd->lex->is_ignore(),
++        &rows_loaded, &handled);
++    if (handled) {
++      mysql_file_close(file, MYF(0));
++      table->file->ha_release_auto_increment();
++      if (ld_err) return true;  // engine raised the error
++      info.stats.records = rows_loaded;
++      info.stats.copied = rows_loaded;
++      char ok_msg[FN_REFLEN + 64];
++      snprintf(ok_msg, sizeof(ok_msg), ER_THD(thd, ER_LOAD_INFO),
++               (long)info.stats.records, 0L, 0L,
++               (long)thd->get_stmt_da()->current_statement_cond_count());
++      my_ok(thd, info.stats.copied, 0L, ok_msg);
++      return false;
++    }
++    // not handled: fall through to the normal row-by-row path below.
++  }
++  // -------------------------------------------------------------------------
++
+   READ_INFO read_info(
+       file, tot_length,
+       (m_exchange.file_info.cs != nullptr) ? m_exchange.file_info.cs
