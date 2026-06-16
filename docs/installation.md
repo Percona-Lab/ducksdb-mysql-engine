@@ -1,12 +1,74 @@
 # Installation
 
-This guide covers building `mysqld` with the DuckDB storage engine compiled in,
-acquiring DuckDB, applying the required server patch, initializing a data
-directory, and starting the server. A Docker-based path is included.
+This guide covers two ways to run the engine: the prebuilt Docker image (quickest)
+and building `mysqld` from source with the DuckDB storage engine compiled in
+(acquiring DuckDB, applying the server patch, initializing a data directory, and
+starting the server).
 
 The engine is **built into the server** as a MANDATORY storage engine — there is
 no loadable plugin to `INSTALL`. Once `mysqld` is built and running, `ENGINE=DuckDB`
 is available immediately.
+
+If you just want to use the engine, start with the prebuilt Docker image below.
+To build from source, skip to [Prerequisites](#prerequisites).
+
+## Quick start: the prebuilt Docker image
+
+The published image ships MySQL 9.7 with the DuckDB engine already built in — no
+build step and no plugin to load.
+
+```sh
+docker pull evgeniypatlan/test-images:mysql-9.7-duckdb-v0.1.0
+```
+
+Run it, publishing the MySQL port, setting a root password, and mounting a volume
+so the data survives restarts:
+
+```sh
+docker run -d --name mysql-duckdb \
+  -p 3306:3306 \
+  -e MYSQL_ROOT_PASSWORD=secret \
+  -v mysql-duckdb-data:/var/lib/mysql \
+  evgeniypatlan/test-images:mysql-9.7-duckdb-v0.1.0
+```
+
+Connect with any MySQL client:
+
+```sh
+mysql -h 127.0.0.1 -P 3306 -u root -psecret
+```
+
+Create an `ENGINE=DuckDB` table and run an analytical query:
+
+```sql
+CREATE DATABASE shop;
+USE shop;
+CREATE TABLE sales (id INT PRIMARY KEY, region INT, amount DECIMAL(12,2)) ENGINE=DuckDB;
+INSERT INTO sales VALUES (1,1,100.00),(2,1,200.00),(3,2,50.00),(4,2,75.50),(5,3,300.00);
+SELECT region, COUNT(*) c, SUM(amount) total FROM sales GROUP BY region ORDER BY region;
+
+-- confirm the query was executed inside DuckDB (counter increments on pushdown):
+SHOW GLOBAL STATUS LIKE 'Ducksdb_pushdown_count';
+```
+
+`SHOW ENGINES` lists `DuckDB` as a supported engine.
+
+### Configuration
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| env `MYSQL_ROOT_PASSWORD` | empty | Root password. Empty means a passwordless root — for local/dev use only. |
+| env `MYSQL_DATADIR` | `/var/lib/mysql` | Data directory inside the container. |
+| `-p 3306:3306` | — | Publish the MySQL port to the host. |
+| `-v <volume>:/var/lib/mysql` | — | Persist data across restarts. |
+
+The data directory is initialized automatically on first run. Each MySQL schema
+is stored as a `<schema>.duckdb` file under the data directory alongside the
+normal MySQL catalog, so mounting a volume at `/var/lib/mysql` keeps both.
+
+For which queries run in DuckDB, the supported types and collations, and more
+examples, see [usage.md](usage.md). To build the image yourself, see
+[Docker: building from source](#docker-building-from-source).
 
 ## Prerequisites
 
@@ -138,7 +200,10 @@ Connect with the built client and confirm the engine:
 SELECT engine, support FROM information_schema.engines WHERE engine='DuckDB';
 ```
 
-## Docker-based path
+## Docker: building from source
+
+This section is for building the engine and image yourself; to simply run the
+engine, use the [prebuilt image](#quick-start-the-prebuilt-docker-image) above.
 
 The build and test scripts are written to run inside a builder container with the
 repository mounted at `/work`. Building the server:
@@ -166,6 +231,22 @@ scripts/run-mtr.sh --record auto_pushdown
 
 The engine is built in (MANDATORY), so there is no plugin to load; the runner
 allows running as `root` inside the container.
+
+### Building the runtime image
+
+After a server build, `scripts/release-image.sh` packages it into a slim runtime
+image: it runs `cmake --install`, prunes and strips the install, and builds the
+image from `docker/Dockerfile`. Use a `Release` or `RelWithDebInfo` build for a
+small image.
+
+```sh
+BUILD_TYPE=RelWithDebInfo scripts/build-server.sh
+scripts/release-image.sh myrepo/mysql:9.7-duckdb
+```
+
+The image initializes its data directory on first run and starts `mysqld` via
+`docker/entrypoint.sh`; it honors `MYSQL_ROOT_PASSWORD` and `MYSQL_DATADIR` as
+described in [Quick start](#quick-start-the-prebuilt-docker-image).
 
 ## Running the unit tests
 

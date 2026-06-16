@@ -13,6 +13,26 @@ tables are all `ENGINE=DuckDB`: the query is regenerated in DuckDB's dialect, ru
 in DuckDB, and the result streamed back. Anything it can't translate declines
 transparently and falls back to normal MySQL execution.
 
+## Run with Docker
+
+A prebuilt image ships MySQL 9.7 with the engine already built in:
+
+```sh
+docker run -d --name mysql-duckdb -p 3306:3306 \
+  -e MYSQL_ROOT_PASSWORD=secret \
+  -v mysql-duckdb-data:/var/lib/mysql \
+  evgeniypatlan/test-images:mysql-9.7-duckdb-v0.1.0
+
+mysql -h 127.0.0.1 -u root -psecret -e "
+  CREATE DATABASE shop; USE shop;
+  CREATE TABLE sales (id INT PRIMARY KEY, region INT, amount DECIMAL(12,2)) ENGINE=DuckDB;
+  INSERT INTO sales VALUES (1,1,100),(2,1,200),(3,2,50);
+  SELECT region, SUM(amount) FROM sales GROUP BY region;"
+```
+
+See [docs/installation.md](docs/installation.md) for configuration and persistence,
+and [docs/usage.md](docs/usage.md) for the full query guide.
+
 ## Layout
 
 - `engine/` — the handler (`ha_duckdb`) and the whole-query pushdown

@@ -16,6 +16,27 @@ is streamed back to the client. Anything the engine cannot translate exactly
 declines transparently and falls back to normal MySQL execution, so results are
 always correct.
 
+## Quick start
+
+The fastest way to try it is the prebuilt Docker image (MySQL 9.7 with the engine
+already built in):
+
+```sh
+docker run -d --name mysql-duckdb -p 3306:3306 \
+  -e MYSQL_ROOT_PASSWORD=secret \
+  evgeniypatlan/test-images:mysql-9.7-duckdb-v0.1.0
+
+mysql -h 127.0.0.1 -u root -psecret -e "
+  CREATE DATABASE shop; USE shop;
+  CREATE TABLE sales (id INT PRIMARY KEY, region INT, amount DECIMAL(12,2)) ENGINE=DuckDB;
+  INSERT INTO sales VALUES (1,1,100),(2,1,200),(3,2,50);
+  SELECT region, SUM(amount) FROM sales GROUP BY region;"
+```
+
+See [installation.md](installation.md#quick-start-the-prebuilt-docker-image) for
+configuration (passwords, persistent volumes) and [usage.md](usage.md) for the
+full query guide.
+
 ## What you get
 
 - **Standard DDL/DML.** `CREATE TABLE ... ENGINE=DuckDB`, `INSERT`,
@@ -36,7 +57,7 @@ always correct.
 | Document | Contents |
 |----------|----------|
 | [architecture.md](architecture.md) | Components, layering, and the data-flow / sequence diagrams for DDL, writes, reads, whole-query pushdown, and transactions. |
-| [installation.md](installation.md) | Prerequisites, building `mysqld` with the engine, the server patch, DuckDB acquisition, initializing a data directory, and a Docker-based path. |
+| [installation.md](installation.md) | Running the prebuilt Docker image (quick start), and building from source: prerequisites, the server patch, DuckDB acquisition, initializing a data directory, and building the runtime image. |
 | [usage.md](usage.md) | End-user guide: creating tables, loading data, query examples, confirming pushdown, supported types and collations, transactions, and current limitations. |
 
 ## Repository layout
