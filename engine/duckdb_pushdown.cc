@@ -26,6 +26,7 @@
 #include "sql/item_cmpfunc.h"
 #include "sql/item_func.h"
 #include "sql/item_sum.h"
+#include "sql/item_timefunc.h"  // Item_extract (EXTRACT)
 #include "sql/query_options.h"  // TMP_TABLE_ALL_COLUMNS
 #include "sql/query_result.h"
 #include "sql/sql_class.h"
@@ -232,6 +233,7 @@ namespace {
 struct BuildCtx {
   duckdb::vector<duckdb::Value> params;
   Query_block *qb{nullptr};
+  const THD *thd{nullptr};  // for get_limit/get_offset/session limits
   // Single-schema guard: all leaf tables must share one DuckDB file.
   const char *db{nullptr};
   size_t dblen{0};
@@ -393,6 +395,45 @@ bool RenderAggregate(BuildCtx *ctx, Item_sum *agg, std::string *out) {
 }
 
 // Any scalar expression appearing in SELECT/GROUP BY/ORDER BY/predicate operand.
+// EXTRACT(<unit> FROM <temporal>): DuckDB EXTRACT matches MySQL for the plain
+// calendar units below on a genuine temporal operand. Week (MySQL mode-dependent
+// numbering), time units, and compound units (YEAR_MONTH etc.) differ — decline.
+// The operand must be temporal so there is no implicit string->date parse to
+// diverge on.
+bool RenderExtract(BuildCtx *ctx, Item_func *fn, std::string *out) {
+  auto *ex = down_cast<Item_extract *>(fn);
+  const char *unit = nullptr;
+  switch (ex->int_type) {
+    case INTERVAL_YEAR:
+      unit = "year";
+      break;
+    case INTERVAL_QUARTER:
+      unit = "quarter";
+      break;
+    case INTERVAL_MONTH:
+      unit = "month";
+      break;
+    case INTERVAL_DAY:
+      unit = "day";
+      break;
+    default:
+      return false;
+  }
+  if (fn->argument_count() != 1) return false;
+  Item *a = fn->arguments()[0]->real_item();
+  if (a == nullptr) return false;
+  bool temporal = a->is_temporal();
+  if (!temporal && a->type() == Item::FIELD_ITEM) {
+    const Field *f = down_cast<const Item_field *>(a)->field;
+    temporal = (f != nullptr && is_temporal_real_type(f->real_type()));
+  }
+  if (!temporal) return false;
+  std::string arg;
+  if (!RenderExpr(ctx, fn->arguments()[0], &arg)) return false;
+  *out = std::string("EXTRACT(") + unit + " FROM " + arg + ")";
+  return true;
+}
+
 bool RenderExpr(BuildCtx *ctx, Item *it, std::string *out) {
   if (it == nullptr) return false;
   Item *r = it->real_item();
@@ -433,6 +474,8 @@ bool RenderExpr(BuildCtx *ctx, Item *it, std::string *out) {
           return RenderArith(ctx, fn, "/", out);
         case Item_func::CASE_FUNC:
           return RenderCase(ctx, fn, out);
+        case Item_func::EXTRACT_FUNC:
+          return RenderExtract(ctx, fn, out);
         default:
           return false;  // non-whitelisted scalar function: decline
       }
@@ -709,14 +752,63 @@ bool RenderSelectItem(BuildCtx *ctx, Item *it, std::string *out) {
   return true;
 }
 
-// FROM list: comma-separated base ENGINE=DuckDB tables. Inner joins are rendered
-// as a cross product + WHERE conjunct (DuckDB accepts this and it is exactly an
-// inner join); outer joins / nested-join trees are out of scope for v1 of the
-// builder and decline.
-bool RenderFrom(BuildCtx *ctx, std::string *out) {
+bool RenderQueryBlock(BuildCtx *ctx, Query_block *qb, std::string *out);
+
+// FROM list: comma-separated entries from the block's leaf table list. Iterating
+// leaf_tables (not next_local) is what makes MERGED derived tables transparent:
+// when MySQL merges an inline view into its parent (the common case for a derived
+// table with no aggregation, e.g. TPC-H Q9's `profit` view), the parent block's
+// leaf_tables already holds the inner base tables directly and the outer SELECT/
+// WHERE/GROUP BY have been rewritten to reference those base columns — so this
+// renders exactly the flat join with NO derived syntax needed. A MATERIALIZED
+// derived table (not merged) instead appears as a single leaf whose `table` is the
+// materialization temp table; that leaf is rendered as a parenthesized sub-select.
+//
+// Base ENGINE=DuckDB tables render as "name" [AS alias]; a materialized derived
+// table renders as "(<inner select>) AS alias". Inner joins are a cross product +
+// WHERE conjunct (DuckDB treats this as an inner join). Outer joins / nested-join
+// trees are out of scope and decline. For a flat single-block query the leaf list
+// is exactly the base tables, so existing single-block queries are unaffected.
+bool RenderFrom(BuildCtx *ctx, Query_block *qb, std::string *out) {
   std::string from;
-  for (Table_ref *tr = ctx->qb->leaf_tables; tr != nullptr;
-       tr = tr->next_leaf) {
+  for (Table_ref *tr = qb->leaf_tables; tr != nullptr; tr = tr->next_leaf) {
+    // Outer joins change NULL-extension semantics; decline.
+    if (tr->outer_join != 0 || tr->is_inner_table_of_outer_join())
+      return false;
+
+    // Materialized derived table (an un-merged inline view): render its inner
+    // query block as a parenthesized sub-select. A MERGED derived table never
+    // reaches here as a derived leaf — its base tables are the leaves instead, so
+    // we only special-case the non-merged form. is_merged() distinguishes them
+    // (effective_algorithm == VIEW_ALGORITHM_MERGE). Views (is_derived() false)
+    // and other refs fall through to the base-table path, which declines on a null
+    // TABLE.
+    if (tr->is_derived() && !tr->is_merged()) {
+      Query_expression *du = tr->derived_query_expression();
+      if (du == nullptr) return false;
+      // Only a simple single query block (no UNION/EXCEPT/INTERSECT). is_simple()
+      // dereferences m_query_term unconditionally, so guard it first.
+      if (du->query_term() == nullptr || !du->is_simple()) return false;
+      Query_block *inner_qb = du->first_query_block();
+      if (inner_qb == nullptr || inner_qb->next_query_block() != nullptr)
+        return false;
+      // Correlated / LATERAL derived tables reference outer columns inside the
+      // inner block; rendered as a standalone "(SELECT …) AS alias" those refs
+      // would bind wrong (or only error at DuckDB execution). Decline
+      // deterministically rather than rely on DuckDB to reject it.
+      if (du->m_lateral_deps != 0 || inner_qb->is_dependent()) return false;
+      const char *alias = tr->alias;
+      if (alias == nullptr || alias[0] == '\0') return false;  // need a name to qualify
+      std::string inner;
+      // The inner block's own tables are validated by the recursive RenderFrom
+      // (same ctx → shared single-schema + ENGINE=DuckDB guards).
+      if (!RenderQueryBlock(ctx, inner_qb, &inner)) return false;
+      std::string ref = "(" + inner + ") AS " + QuoteIdent(alias);
+      if (!from.empty()) from += ", ";
+      from += ref;
+      continue;
+    }
+
     TABLE *table = tr->table;
     if (table == nullptr || table->s == nullptr) return false;
     if (table->s->db_type() != ducksdb_hton) return false;
@@ -728,9 +820,6 @@ bool RenderFrom(BuildCtx *ctx, std::string *out) {
                memcmp(ctx->db, table->s->db.str, ctx->dblen) != 0) {
       return false;  // cross-schema join — different DuckDB files
     }
-    // Outer joins change NULL-extension semantics; decline in v1 of the builder.
-    if (tr->outer_join != 0 || tr->is_inner_table_of_outer_join())
-      return false;
     const char *name = tr->table_name != nullptr ? tr->table_name : "";
     std::string ref = QuoteIdent(name);
     // Carry an alias when the table was aliased (so qualified column refs in the
@@ -744,6 +833,140 @@ bool RenderFrom(BuildCtx *ctx, std::string *out) {
   }
   if (from.empty()) return false;
   *out = from;
+  return true;
+}
+
+// Assemble one complete, parenthesizable SELECT for the given query block:
+// SELECT list + FROM + WHERE + GROUP BY + HAVING + ORDER BY + LIMIT. Reads the
+// PASSED qb (never ctx->qb), so it is reusable for the top block and for any
+// derived (inline-view) sub-block via RenderFrom. Returns false (decline) on any
+// unsupported node; the shared ctx threads params and the single-schema guard
+// through every nested block.
+bool RenderQueryBlock(BuildCtx *ctx, Query_block *qb, std::string *out) {
+  auto decline = [](const char *why) -> bool {
+    if (PdTiming()) {
+      fprintf(stderr, "[pd-decline-at] %s\n", why);
+      fflush(stderr);
+    }
+    return false;
+  };
+
+  // FROM (also runs the single-schema + ENGINE=DuckDB + outer-join gates, and
+  // recurses into derived tables).
+  std::string from_sql;
+  if (!RenderFrom(ctx, qb, &from_sql)) return decline("from");
+
+  // SELECT list — render from the block's resolved visible select items. Every
+  // item must render or we decline. RenderSelectItem appends "AS <alias>" so a
+  // derived block exposes named output columns the outer block can reference.
+  std::string select_sql;
+  bool first = true;
+  for (Item *it : qb->visible_fields()) {
+    std::string item_sql;
+    if (!RenderSelectItem(ctx, it, &item_sql)) return decline("select-item");
+    if (!first) select_sql += ", ";
+    select_sql += item_sql;
+    first = false;
+  }
+  if (first) return decline("empty-select");
+
+  std::string sql = "SELECT ";
+  if (qb->is_distinct()) sql += "DISTINCT ";
+  sql += select_sql + " FROM " + from_sql;
+
+  // WHERE.
+  if (Item *w = qb->where_cond()) {
+    std::string where_sql;
+    if (!RenderPredicate(ctx, w, &where_sql)) return decline("where");
+    sql += " WHERE " + where_sql;
+  }
+
+  // GROUP BY. DuckDB requires EVERY non-aggregated SELECT column to appear in
+  // GROUP BY; MySQL relaxes this via functional dependency and its optimizer may
+  // have PRUNED FD-determined columns out of group_list. So emit the UNION of the
+  // (possibly pruned) group_list and every non-aggregate visible SELECT column.
+  // This is semantically identical — the pruned columns are single-valued within
+  // each group, so adding them creates no new groups — and is valid for DuckDB.
+  if (qb->group_list.elements > 0) {
+    std::vector<std::string> keys;
+    auto add_key = [&keys](const std::string &s) {
+      for (const auto &k : keys)
+        if (k == s) return;
+      keys.push_back(s);
+    };
+    for (ORDER *g = qb->group_list.first; g != nullptr; g = g->next) {
+      std::string g_sql;
+      if (!RenderExpr(ctx, *g->item, &g_sql)) return decline("group");
+      add_key(g_sql);
+    }
+    for (Item *it : qb->visible_fields()) {
+      if (it->has_aggregation()) continue;  // aggregates are not group keys
+      std::string s_sql;
+      if (!RenderExpr(ctx, it, &s_sql)) return decline("group-select");
+      add_key(s_sql);
+    }
+    std::string group_sql;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (i) group_sql += ", ";
+      group_sql += keys[i];
+    }
+    if (!keys.empty()) sql += " GROUP BY " + group_sql;
+  }
+
+  // HAVING.
+  if (Item *h = qb->having_cond()) {
+    std::string having_sql;
+    if (!RenderPredicate(ctx, h, &having_sql)) return decline("having");
+    sql += " HAVING " + having_sql;
+  }
+
+  // ORDER BY with ASC/DESC.
+  if (qb->order_list.elements > 0) {
+    std::string order_sql;
+    bool ofirst = true;
+    for (ORDER *o = qb->order_list.first; o != nullptr; o = o->next) {
+      std::string o_sql;
+      if (!RenderExpr(ctx, *o->item, &o_sql)) return decline("order");
+      // MySQL sorts NULL as the lowest value (NULLs first on ASC, last on DESC).
+      // DuckDB's default null ordering is the opposite, so emit it EXPLICITLY to
+      // match MySQL regardless of DuckDB's configured default — otherwise an
+      // ORDER BY on a nullable column (especially with LIMIT) returns rows in a
+      // different order / a different row set.
+      o_sql += (o->direction == ORDER_DESC) ? " DESC NULLS LAST"
+                                            : " ASC NULLS FIRST";
+      if (!ofirst) order_sql += ", ";
+      order_sql += o_sql;
+      ofirst = false;
+    }
+    if (!ofirst) sql += " ORDER BY " + order_sql;
+  }
+
+  // LIMIT / OFFSET as bound parameters. We only render an EXPLICIT LIMIT/OFFSET.
+  const ha_rows limit = qb->get_limit(ctx->thd);
+  const ha_rows offset = qb->get_offset(ctx->thd);
+  // Decline ONLY when a FINITE session SQL_SELECT_LIMIT (no explicit clause)
+  // would silently cap rows we don't render. The common case —
+  // SQL_SELECT_LIMIT=DEFAULT (unlimited), get_limit() == HA_POS_ERROR — is safe
+  // to push with no LIMIT clause.
+  if (qb->m_use_select_limit && qb->select_limit == nullptr &&
+      limit != HA_POS_ERROR)
+    return decline("implicit-select-limit");
+  // ha_rows is unsigned 64-bit; DuckDB LIMIT/OFFSET bind as signed BIGINT. A
+  // value above INT64_MAX would wrap to a negative bind param (silently wrong
+  // results), so decline rather than emit it.
+  constexpr ha_rows kInt64Max = static_cast<ha_rows>(INT64_MAX);
+  if (limit != HA_POS_ERROR && qb->select_limit != nullptr) {
+    if (limit > kInt64Max) return decline("limit-overflow");
+    ctx->params.push_back(duckdb::Value::BIGINT(static_cast<int64_t>(limit)));
+    sql += " LIMIT $" + std::to_string(ctx->params.size());
+  }
+  if (offset != 0 && qb->offset_limit != nullptr) {
+    if (offset > kInt64Max) return decline("offset-overflow");
+    ctx->params.push_back(duckdb::Value::BIGINT(static_cast<int64_t>(offset)));
+    sql += " OFFSET $" + std::to_string(ctx->params.size());
+  }
+
+  *out = std::move(sql);
   return true;
 }
 
@@ -770,7 +993,12 @@ bool BuildPushdownSQLBuilder(const THD *thd, JOIN *join, std::string *db_out,
   Query_expression *unit = qb->master_query_expression();
   if (unit == nullptr || !unit->is_simple()) return decline("not-simple/union");
   if (!(qb->is_grouped() || qb->is_implicitly_grouped())) return decline("not-grouped");
-  if (qb->first_inner_query_expression() != nullptr) return decline("subquery");
+  // NOTE: the former blanket `first_inner_query_expression() != nullptr` decline
+  // is intentionally GONE — a derived table is a nested query expression, and we
+  // now support it. Any unsupported nesting still declines downstream:
+  // RenderExpr/RenderPredicate return false on Item_subselect (default case), and
+  // RenderFrom declines any non-derived/unsupported table ref (e.g. a view, or a
+  // derived unit that is not a simple single block).
   if (qb->has_windows()) return decline("windows");
   if (qb->olap != UNSPECIFIED_OLAP_TYPE) return decline("rollup");
   if (thd->lex->param_list.elements != 0) return decline("params");
@@ -778,124 +1006,14 @@ bool BuildPushdownSQLBuilder(const THD *thd, JOIN *join, std::string *db_out,
 
   BuildCtx ctx;
   ctx.qb = qb;
+  ctx.thd = thd;
 
-  // FROM (also runs the single-schema + ENGINE=DuckDB + outer-join gates).
-  std::string from_sql;
-  if (!RenderFrom(&ctx, &from_sql)) return decline("from");
-
-  // SELECT list — render from the query block's ORIGINAL resolved select items
-  // (visible_fields()), not a post-optimization ref slice. At the pushdown hook
-  // these coincide (REF_SLICE_SAVED_BASE), and the column order matches what
-  // ExecutePushdown streams back; using the canonical list keeps the builder
-  // correct regardless of slice state. Every item must render or we decline.
-  std::string select_sql;
-  bool first = true;
-  for (Item *it : qb->visible_fields()) {
-    std::string item_sql;
-    if (!RenderSelectItem(&ctx, it, &item_sql)) return decline("select-item");
-    if (!first) select_sql += ", ";
-    select_sql += item_sql;
-    first = false;
-  }
-  if (first) return decline("empty-select");
-
-  std::string sql = "SELECT ";
-  if (qb->is_distinct()) sql += "DISTINCT ";
-  sql += select_sql + " FROM " + from_sql;
-
-  // WHERE.
-  if (Item *w = qb->where_cond()) {
-    std::string where_sql;
-    if (!RenderPredicate(&ctx, w, &where_sql)) return decline("where");
-    sql += " WHERE " + where_sql;
-  }
-
-  // GROUP BY. DuckDB requires EVERY non-aggregated SELECT column to appear in
-  // GROUP BY; MySQL relaxes this via functional dependency and its optimizer may
-  // have PRUNED FD-determined columns out of group_list. So emit the UNION of the
-  // (possibly pruned) group_list and every non-aggregate visible SELECT column.
-  // This is semantically identical — the pruned columns are single-valued within
-  // each group, so adding them creates no new groups — and is valid for DuckDB.
-  if (qb->group_list.elements > 0) {
-    std::vector<std::string> keys;
-    auto add_key = [&keys](const std::string &s) {
-      for (const auto &k : keys)
-        if (k == s) return;
-      keys.push_back(s);
-    };
-    for (ORDER *g = qb->group_list.first; g != nullptr; g = g->next) {
-      std::string g_sql;
-      if (!RenderExpr(&ctx, *g->item, &g_sql)) return decline("group");
-      add_key(g_sql);
-    }
-    for (Item *it : qb->visible_fields()) {
-      if (it->has_aggregation()) continue;  // aggregates are not group keys
-      std::string s_sql;
-      if (!RenderExpr(&ctx, it, &s_sql)) return decline("group-select");
-      add_key(s_sql);
-    }
-    std::string group_sql;
-    for (size_t i = 0; i < keys.size(); ++i) {
-      if (i) group_sql += ", ";
-      group_sql += keys[i];
-    }
-    if (!keys.empty()) sql += " GROUP BY " + group_sql;
-  }
-
-  // HAVING.
-  if (Item *h = qb->having_cond()) {
-    std::string having_sql;
-    if (!RenderPredicate(&ctx, h, &having_sql)) return decline("having");
-    sql += " HAVING " + having_sql;
-  }
-
-  // ORDER BY with ASC/DESC.
-  if (qb->order_list.elements > 0) {
-    std::string order_sql;
-    bool ofirst = true;
-    for (ORDER *o = qb->order_list.first; o != nullptr; o = o->next) {
-      std::string o_sql;
-      if (!RenderExpr(&ctx, *o->item, &o_sql)) return decline("order");
-      // MySQL sorts NULL as the lowest value (NULLs first on ASC, last on DESC).
-      // DuckDB's default null ordering is the opposite, so emit it EXPLICITLY to
-      // match MySQL regardless of DuckDB's configured default — otherwise an
-      // ORDER BY on a nullable column (especially with LIMIT) returns rows in a
-      // different order / a different row set.
-      o_sql += (o->direction == ORDER_DESC) ? " DESC NULLS LAST"
-                                            : " ASC NULLS FIRST";
-      if (!ofirst) order_sql += ", ";
-      order_sql += o_sql;
-      ofirst = false;
-    }
-    if (!ofirst) sql += " ORDER BY " + order_sql;
-  }
-
-  // LIMIT / OFFSET as bound parameters. We only render an EXPLICIT LIMIT/OFFSET.
-  const ha_rows limit = qb->get_limit(thd);
-  const ha_rows offset = qb->get_offset(thd);
-  // Decline ONLY when a FINITE session SQL_SELECT_LIMIT (no explicit clause) would
-  // silently cap rows we don't render. The common case — SQL_SELECT_LIMIT=DEFAULT,
-  // i.e. unlimited, where get_limit() == HA_POS_ERROR — is safe to push with no
-  // LIMIT clause. (The old unconditional gate here declined every no-LIMIT query.)
-  if (qb->m_use_select_limit && qb->select_limit == nullptr &&
-      limit != HA_POS_ERROR)
-    return decline("implicit-select-limit");
-  // ha_rows is unsigned 64-bit; DuckDB LIMIT/OFFSET bind as signed BIGINT. A value
-  // above INT64_MAX would wrap to a negative bind param (silently wrong results),
-  // so decline pushdown rather than emit it (such limits are absurd in practice).
-  constexpr ha_rows kInt64Max = static_cast<ha_rows>(INT64_MAX);
-  if (limit != HA_POS_ERROR && qb->select_limit != nullptr) {
-    if (limit > kInt64Max) return decline("limit-overflow");
-    ctx.params.push_back(
-        duckdb::Value::BIGINT(static_cast<int64_t>(limit)));
-    sql += " LIMIT $" + std::to_string(ctx.params.size());
-  }
-  if (offset != 0 && qb->offset_limit != nullptr) {
-    if (offset > kInt64Max) return decline("offset-overflow");
-    ctx.params.push_back(
-        duckdb::Value::BIGINT(static_cast<int64_t>(offset)));
-    sql += " OFFSET $" + std::to_string(ctx.params.size());
-  }
+  // Assemble the complete top-level SELECT (recurses into derived tables). The
+  // single-schema + ENGINE=DuckDB + outer-join guards run inside RenderFrom for
+  // every block (top and nested) via the shared ctx.
+  std::string sql;
+  if (!RenderQueryBlock(&ctx, qb, &sql)) return decline("query-block");
+  if (ctx.db == nullptr) return decline("no-schema");
 
   *db_out = std::string(ctx.db, ctx.dblen);
   *sql_out = std::move(sql);

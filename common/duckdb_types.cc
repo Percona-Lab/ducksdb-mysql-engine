@@ -410,13 +410,49 @@ int StoreField(Field *field, const duckdb::Value &value) {
     }
 }
 
-// Read one integer cell from a flat vector and store it, handling signedness.
-template <typename Signed, typename Unsigned>
-static inline void StoreFlatInt(Field *field, duckdb::Vector &vec, size_t row) {
-    if (field->is_unsigned())
-        field->store(static_cast<longlong>(duckdb::FlatVector::GetData<Unsigned>(vec)[row]), true);
-    else
-        field->store(static_cast<longlong>(duckdb::FlatVector::GetData<Signed>(vec)[row]), false);
+// Read one integer cell using the DuckDB VECTOR's actual physical width, then
+// store into the MySQL integer field (whatever its width). On the scan path the
+// vector width always equals the field width, so this reads exactly the same
+// bytes the old field-keyed read did. On the pushdown path a computed column's
+// DuckDB type can be WIDER than the MySQL result field — e.g. DuckDB
+// EXTRACT(year FROM …) yields BIGINT while MySQL types EXTRACT(YEAR …) as INT, so
+// the staging Field is MYSQL_TYPE_LONG (int32) but the result vector is BIGINT.
+// Reading by the vector's true type avoids DuckDB's "Expected vector of type
+// INT32, but found vector of BIGINT" fetch error; Field::store(longlong) then
+// applies the field's normal range handling. Returns false if the vector type is
+// not an integer flavor (caller falls back to the field-keyed path).
+static inline bool StoreFlatIntByVectorType(Field *field, duckdb::Vector &vec,
+                                            size_t row) {
+    const bool uns = field->is_unsigned();
+    switch (vec.GetType().id()) {
+        case duckdb::LogicalTypeId::TINYINT:
+            field->store(static_cast<longlong>(duckdb::FlatVector::GetData<int8_t>(vec)[row]), false);
+            return true;
+        case duckdb::LogicalTypeId::SMALLINT:
+            field->store(static_cast<longlong>(duckdb::FlatVector::GetData<int16_t>(vec)[row]), false);
+            return true;
+        case duckdb::LogicalTypeId::INTEGER:
+            field->store(static_cast<longlong>(duckdb::FlatVector::GetData<int32_t>(vec)[row]), false);
+            return true;
+        case duckdb::LogicalTypeId::BIGINT:
+            field->store(static_cast<longlong>(duckdb::FlatVector::GetData<int64_t>(vec)[row]), false);
+            return true;
+        case duckdb::LogicalTypeId::UTINYINT:
+            field->store(static_cast<longlong>(duckdb::FlatVector::GetData<uint8_t>(vec)[row]), true);
+            return true;
+        case duckdb::LogicalTypeId::USMALLINT:
+            field->store(static_cast<longlong>(duckdb::FlatVector::GetData<uint16_t>(vec)[row]), true);
+            return true;
+        case duckdb::LogicalTypeId::UINTEGER:
+            field->store(static_cast<longlong>(duckdb::FlatVector::GetData<uint32_t>(vec)[row]), true);
+            return true;
+        case duckdb::LogicalTypeId::UBIGINT:
+            field->store(static_cast<longlong>(duckdb::FlatVector::GetData<uint64_t>(vec)[row]), true);
+            return true;
+        default:
+            (void)uns;
+            return false;  // not a fixed-width integer vector
+    }
 }
 
 int StoreFlatCell(Field *field, duckdb::Vector &vec, size_t row) {
@@ -427,18 +463,16 @@ int StoreFlatCell(Field *field, duckdb::Vector &vec, size_t row) {
     field->set_notnull();
     switch (field->real_type()) {
         case MYSQL_TYPE_TINY:
-            StoreFlatInt<int8_t, uint8_t>(field, vec, row);
-            return 0;
         case MYSQL_TYPE_SHORT:
-            StoreFlatInt<int16_t, uint16_t>(field, vec, row);
-            return 0;
         case MYSQL_TYPE_INT24:
         case MYSQL_TYPE_LONG:
-            StoreFlatInt<int32_t, uint32_t>(field, vec, row);
-            return 0;
         case MYSQL_TYPE_LONGLONG:
-            StoreFlatInt<int64_t, uint64_t>(field, vec, row);
-            return 0;
+            // Read by the DuckDB vector's true integer width (handles a result
+            // column that is wider than the MySQL field, e.g. EXTRACT→BIGINT into
+            // an INT field). Falls back to the value path for non-integer vectors
+            // (e.g. a DECIMAL/HUGEINT result feeding an integer field).
+            if (StoreFlatIntByVectorType(field, vec, row)) return 0;
+            return StoreField(field, vec.GetValue(row));
         case MYSQL_TYPE_FLOAT:
             field->store(static_cast<double>(duckdb::FlatVector::GetData<float>(vec)[row]));
             return 0;
