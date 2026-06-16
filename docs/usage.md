@@ -331,6 +331,16 @@ These follow directly from the implementation:
 - **Pushdown is for analytical (aggregate) queries.** Non-aggregate `SELECT`s run
   through the normal row path by design; they are correct but not column-store
   accelerated.
+- **Decimal division and `AVG` are evaluated in floating point.** DuckDB has no
+  exact-decimal division operator: `DECIMAL / DECIMAL` and `AVG(DECIMAL)` are
+  computed in double precision and the result is rounded back into MySQL's
+  `DECIMAL` result column. Exact `SUM`, `+`, `-`, and `*` over `DECIMAL` stay
+  exact. The floating-point path matches MySQL's exact-decimal result for normal
+  data (verified against InnoDB on TPC-H SF1/SF10, including the `AVG` of Q1 and
+  the revenue ratio of Q14), but at a rounding boundary with adversarial values
+  the last digit can differ. If you require bit-exact decimal division/averages,
+  keep those expressions out of pushed queries (or run them as non-aggregate
+  scans, which use the normal MySQL path).
 - **Literal and collation gating.** Floating-point, string, and temporal literals
   and unmapped collations cause a query to decline rather than risk a divergent
   result.
