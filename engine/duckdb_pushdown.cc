@@ -157,7 +157,15 @@ bool ItemLiteralToValue(Item *it, duckdb::Value *out) {
     }
     return true;
   }
-  if (!r->basic_const_item()) return false;
+  // Bind any constant the optimizer can evaluate, not just raw literals. MySQL
+  // const-folds expressions like `1 + 10` into a cached constant that is neither
+  // basic_const_item() nor a FUNC_ITEM, so the structural switch would decline it
+  // (this is what blocked TPC-H Q19's `l_quantity <= 1 + 10`). const_item()
+  // guarantees a stable, table-independent value for the whole query, and we bind
+  // that evaluated value (val_int/val_decimal/val_str) — DuckDB uses the bound
+  // value verbatim, so binding the folded constant is exactly equivalent. REAL
+  // still declines below (float intermediary risks ULP drift).
+  if (!r->const_item()) return false;
   switch (r->result_type()) {
     case INT_RESULT: {
       const longlong v = r->val_int();
@@ -389,12 +397,13 @@ bool RenderExpr(BuildCtx *ctx, Item *it, std::string *out) {
   if (it == nullptr) return false;
   Item *r = it->real_item();
   if (r == nullptr) return false;  // Item_ref/Item_cache not unwrappable
-  // Constants bind as $N params via ItemLiteralToValue — try this FIRST so a
-  // constant that is a FUNC_ITEM (e.g. CAST('1998-09-02' AS date)) or a
-  // string/temporal literal is bound rather than falling into the structural
-  // switch below (which only knows fields, aggregates, +-*/, CASE). A const we
-  // cannot bind (REAL, or const arithmetic like 1+1) declines here without
-  // pushing a param and falls through to structural rendering.
+  // Constants bind as $N params via ItemLiteralToValue — try this FIRST so any
+  // constant the optimizer can evaluate (a CAST like CAST('1998-09-02' AS date),
+  // a string/temporal literal, or const-folded arithmetic like 1+10) is bound by
+  // value rather than falling into the structural switch below (which only knows
+  // fields, aggregates, +-*/, CASE). A const we cannot bind (REAL — float ULP
+  // drift) declines here without pushing a param and falls through to structural
+  // rendering.
   if (r->const_item()) {
     std::string lit;
     if (RenderLiteral(ctx, r, &lit)) {

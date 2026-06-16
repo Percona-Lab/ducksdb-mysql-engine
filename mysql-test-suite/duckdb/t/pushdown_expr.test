@@ -79,6 +79,20 @@ SELECT 100.0 *
 SELECT VARIABLE_VALUE-@p7 AS pushed FROM performance_schema.global_status
   WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
 
+--echo #### disjunctive OR + const-folded arithmetic in predicate -> pushed (Q19 shape) ####
+# Top-level OR of AND-blocks with const arithmetic on a comparison RHS (50+100).
+# MySQL const-folds `50+100` into a cached constant that is neither a literal nor
+# a FUNC_ITEM; binding any evaluatable const (not just literals) is what lets this
+# push -- the TPC-H Q19 blocker.
+SELECT VARIABLE_VALUE INTO @pq FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+SELECT category, SUM(amount) tot FROM sales
+  WHERE (category='a' AND amount >= 100 AND amount <= 50 + 100)
+     OR (category='b' AND amount >= 300 AND amount <= 100 + 350)
+  GROUP BY category ORDER BY category;
+SELECT VARIABLE_VALUE-@pq AS pushed FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+
 --echo #### ORDER BY nullable key: NULLs ordered like MySQL (NULLs first on ASC) ####
 # DuckDB's default null ordering is the opposite of MySQL's; with LIMIT this would
 # otherwise select a different row set. Add a NULL-category row and confirm the

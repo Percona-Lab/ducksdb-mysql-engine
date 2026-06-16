@@ -96,6 +96,20 @@ SELECT VARIABLE_VALUE-@p7 AS pushed FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
 pushed
 1
+#### disjunctive OR + const-folded arithmetic in predicate -> pushed (Q19 shape) ####
+SELECT VARIABLE_VALUE INTO @pq FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+SELECT category, SUM(amount) tot FROM sales
+WHERE (category='a' AND amount >= 100 AND amount <= 50 + 100)
+OR (category='b' AND amount >= 300 AND amount <= 100 + 350)
+GROUP BY category ORDER BY category;
+category	tot
+a	100.00
+b	700.25
+SELECT VARIABLE_VALUE-@pq AS pushed FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+pushed
+1
 #### ORDER BY nullable key: NULLs ordered like MySQL (NULLs first on ASC) ####
 INSERT INTO sales VALUES (9,'2024-01-01',10.00,'zz',NULL);
 SELECT VARIABLE_VALUE INTO @p8 FROM performance_schema.global_status
