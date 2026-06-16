@@ -847,7 +847,13 @@ bool BuildPushdownSQLBuilder(const THD *thd, JOIN *join, std::string *db_out,
     for (ORDER *o = qb->order_list.first; o != nullptr; o = o->next) {
       std::string o_sql;
       if (!RenderExpr(&ctx, *o->item, &o_sql)) return decline("order");
-      o_sql += (o->direction == ORDER_DESC) ? " DESC" : " ASC";
+      // MySQL sorts NULL as the lowest value (NULLs first on ASC, last on DESC).
+      // DuckDB's default null ordering is the opposite, so emit it EXPLICITLY to
+      // match MySQL regardless of DuckDB's configured default — otherwise an
+      // ORDER BY on a nullable column (especially with LIMIT) returns rows in a
+      // different order / a different row set.
+      o_sql += (o->direction == ORDER_DESC) ? " DESC NULLS LAST"
+                                            : " ASC NULLS FIRST";
       if (!ofirst) order_sql += ", ";
       order_sql += o_sql;
       ofirst = false;
@@ -1004,8 +1010,11 @@ bool ExecutePushdown(JOIN *join, Query_result *qr) {
   }
   // Defensive: the staging logic below indexes vf[0..visible.size()); a shorter
   // field array would read out of bounds. With TMP_TABLE_ALL_COLUMNS this holds,
-  // but verify rather than trust.
-  if (table->visible_field_count() != visible.size()) {
+  // but verify rather than trust. NOTE: this returns BEFORE the cleanup scope
+  // guard below is established, so it must free the table by hand (no double-free
+  // — the guard does not exist yet). Any new early return inserted between
+  // create_tmp_table and the guard must likewise free the table manually.
+  if (static_cast<size_t>(table->visible_field_count()) != visible.size()) {
     close_tmp_table(table);
     free_tmp_table(table);
     RaiseDuckDBError("pushdown staging field-count mismatch");
@@ -1030,24 +1039,40 @@ bool ExecutePushdown(JOIN *join, Query_result *qr) {
   const auto te2 = PdClock::now();  // staging (temp table + items) done
   my_bitmap_map *org_w = tmp_use_all_columns(table, table->write_set);
   my_bitmap_map *org_r = tmp_use_all_columns(table, table->read_set);
+  // Restore the column maps on EVERY exit from here on (including an exception
+  // thrown by a DuckDB call below): leaving write_set/read_set pointing at
+  // all_set would corrupt the table teardown that the cleanup guard runs.
+  auto map_guard = create_scope_guard([&] {
+    tmp_restore_column_map(table->write_set, org_w);
+    tmp_restore_column_map(table->read_set, org_r);
+  });
   // Stream the result chunk by chunk, reading each column's vector with typed
   // accessors (StoreFlatCell) instead of building a duckdb::Value per cell.
+  // DuckDB's Fetch/Flatten/GetValue can throw; keep exceptions from escaping
+  // into the MySQL executor (which is not exception-safe across the C ABI).
   uint64_t nrows = 0;
   bool err = false;
-  while (!err) {
-    auto chunk = res.Fetch();
-    if (chunk == nullptr || chunk->size() == 0) break;
-    chunk->Flatten();  // ensure FLAT vectors for the typed accessors
-    const size_t n = chunk->size();
-    for (size_t r = 0; r < n && !err; ++r) {
-      for (size_t c = 0; c < visible.size(); ++c)
-        StoreFlatCell(vf[c], chunk->data[c], r);
-      if (qr->send_data(thd, out_items)) err = true;
-      ++nrows;
+  try {
+    while (!err) {
+      auto chunk = res.Fetch();
+      if (chunk == nullptr || chunk->size() == 0) break;
+      chunk->Flatten();  // ensure FLAT vectors for the typed accessors
+      assert(chunk->ColumnCount() == visible.size());
+      const size_t n = chunk->size();
+      for (size_t r = 0; r < n && !err; ++r) {
+        for (size_t c = 0; c < visible.size(); ++c)
+          StoreFlatCell(vf[c], chunk->data[c], r);
+        if (qr->send_data(thd, out_items)) err = true;
+        ++nrows;
+      }
     }
+  } catch (const std::exception &e) {
+    RaiseDuckDBError(e.what());
+    return true;
+  } catch (...) {
+    RaiseDuckDBError("unexpected DuckDB exception during result streaming");
+    return true;
   }
-  tmp_restore_column_map(table->write_set, org_w);
-  tmp_restore_column_map(table->read_set, org_r);
   if (err) return true;
 
   if (PdTiming()) {

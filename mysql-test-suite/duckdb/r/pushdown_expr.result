@@ -96,6 +96,18 @@ SELECT VARIABLE_VALUE-@p7 AS pushed FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
 pushed
 1
+#### ORDER BY nullable key: NULLs ordered like MySQL (NULLs first on ASC) ####
+INSERT INTO sales VALUES (9,'2024-01-01',10.00,'zz',NULL);
+SELECT VARIABLE_VALUE INTO @p8 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+SELECT category, COUNT(*) c FROM sales GROUP BY category ORDER BY category ASC LIMIT 2;
+category	c
+NULL	1
+a	3
+SELECT VARIABLE_VALUE-@p8 AS pushed FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+pushed
+1
 #### point/non-aggregate query -> NOT pushed (normal row path), still correct ####
 SELECT VARIABLE_VALUE INTO @p6 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
