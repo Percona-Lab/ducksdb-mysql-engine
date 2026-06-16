@@ -29,6 +29,51 @@
 
 ---
 
+## Phase 0 RESULTS — roadmap corrections (workflow `wf_cb737f5b-594`)
+
+Discovery (5 parallel classifiers + synthesis) confirmed the construct matrix and corrected the plan:
+
+- **C1 — Split Phase 6. The scalar-function leaves move EARLY.** `EXTRACT`, `SUBSTRING`, `NOT_FUNC`
+  are pure `RenderExpr`/`RenderPredicate` leaves → **Phase 6a, landed right after Phase 1** (Q7/8/9
+  cannot pass their gate without `EXTRACT(YEAR)`). Outer-join nested-tree reconstruction stays late as
+  **Phase 6b** with Q13.
+- **C2 — Semijoin/antijoin strategy INVERTED (critical).** Do **not** reconstruct semijoin nests from
+  `leaf_tables`/`sj_nests` as the primary path — that is where silent wrong-rows live. Instead **render
+  from the surviving original subquery `Query_block`** (via `Item_subselect` / `derived_query_expression()`)
+  and **decline** whenever `JOIN::optimize` already collapsed it into a nest we cannot unambiguously
+  invert. Phase 0 Task 0.2 (observe what survives at the hook) is therefore a **hard design gate** for
+  Phases 4/5, not just informational.
+- **C3 — Correlated-field scoping is a shared capability:** qualify every outer ref via
+  `Item_field::depended_from`/`used_tables()`, land once in Phase 3, reuse for Q2/Q17/Q20/Q21/Q22.
+  Decline if an unqualified field name is ambiguous across the outer+inner FROM union.
+
+**Honest 22/22 assessment — likely-to-remain-declined (decline contract over forced coverage):**
+- **Q8** — top-level `sum(CASE…)/sum(volume)` DIV-of-aggregates has a real DECIMAL-scale vs DuckDB-DOUBLE
+  divergence; declines on the division unless result-type is provably DOUBLE or explicitly cast.
+- **Q17** — `< 0.2*avg()` DECIMAL-vs-DOUBLE boundary + REAL-const gate; strictest reading declines.
+- **Q20** — three nested levels (IN→IN→correlated scalar); most fragile chain; conservative path may decline.
+So the realistic target is **~19–21/22 fully pushing + matching**, with Q8/Q17/Q20 declining on
+*provable-equivalence* grounds (correct fallback), not bugs. (These tie back to the documented decimal
+floating-point limitation.)
+
+**Top decline-contract risks (gate, don't force):** (1) `NOT IN` 3-valued logic → render only if both
+outer col and inner col are NOT NULL, else decline (Q16); (2) un-invertable semi/anti nest (Q18/20/21);
+(3) outer-join ON-vs-WHERE NULL-extension (Q13); (4) correlated mis-scoping with repeated table names
+(Q2/17/20/21/22); (5) avg/division DECIMAL divergence (Q8/17).
+
+**Revised landing order:** 1) RenderQueryBlock recursion → 2) Phase 6a leaves (EXTRACT/SUBSTRING/NOT_FUNC)
+→ 3) derived tables (ship **Q9** first as the clean proof) → 4) scalar (Q11→Q2→Q17) → 5) semijoin
+render-original-or-decline (Q4→Q18) → 6) antijoin NULL-gated (Q16) → 7) outer-join (Q13) → 8) CTE +
+composites (Q15, Q20/21/22).
+
+**FIRST PR (highest ROI):** Phase 1 (`RenderQueryBlock`) + Phase 6a `EXTRACT(YEAR)` + Phase 2 derived
+tables, shipping **Q9** (cleanest: single `nation`, no self-join, no division — isolates the foundational
+machinery from every hazard). **Pre-PR fact to confirm:** whether MySQL 8.0.44 *merges* or *materializes*
+the Q9 derived table at the hook (decides if Phase 2 is a gate-relaxation or a `(subselect) AS alias`
+emitter) — check via `DUCKSDB_PD_TIMING` structural dump.
+
+---
+
 ## How to test (the gate for every phase)
 
 Correctness is the bar; a faster wrong answer is a regression. After each construct phase, build and run the SF1 correctness gate over the queries that phase should unblock (plus the existing 8 as a regression check), then MTR:
