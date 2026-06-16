@@ -83,6 +83,19 @@ SELECT VARIABLE_VALUE-@p5 AS pushed FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
 pushed
 1
+#### post-aggregation arithmetic (ratio over aggregates) -> pushed ####
+SELECT VARIABLE_VALUE INTO @p7 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+SELECT 100.0 *
+SUM(CASE WHEN category='a' THEN amount ELSE 0 END) /
+SUM(amount) AS pct_a
+FROM sales WHERE d >= DATE '2021-01-01';
+pct_a
+32.1423472
+SELECT VARIABLE_VALUE-@p7 AS pushed FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+pushed
+1
 #### point/non-aggregate query -> NOT pushed (normal row path), still correct ####
 SELECT VARIABLE_VALUE INTO @p6 FROM performance_schema.global_status
 WHERE VARIABLE_NAME='Ducksdb_pushdown_count';

@@ -26,6 +26,7 @@
 #include "sql/item_cmpfunc.h"
 #include "sql/item_func.h"
 #include "sql/item_sum.h"
+#include "sql/query_options.h"  // TMP_TABLE_ALL_COLUMNS
 #include "sql/query_result.h"
 #include "sql/sql_class.h"
 #include "sql/sql_lex.h"
@@ -687,17 +688,6 @@ bool RenderCase(BuildCtx *ctx, Item_func *fn, std::string *out) {
 
 // Render one SELECT-list item with its optional alias.
 bool RenderSelectItem(BuildCtx *ctx, Item *it, std::string *out) {
-  // Post-aggregation arithmetic in the SELECT list — an expression *over*
-  // aggregates such as `100*sum(x)/sum(y)` — is rendered correctly but the
-  // result-staging path (ExecutePushdown wrapping each temp-table field in an
-  // Item_field) faults on the computed column. Until that is reworked, decline
-  // any visible item that aggregates but is not itself a bare aggregate, so the
-  // query falls back to normal MySQL execution rather than pushing a plan that
-  // would crash. A bare aggregate (SUM/AVG/COUNT/...) stages fine.
-  if (it->has_aggregation()) {
-    Item *r = it->real_item();
-    if (r == nullptr || r->type() != Item::SUM_FUNC_ITEM) return false;
-  }
   std::string expr;
   if (!RenderExpr(ctx, it, &expr)) return false;
   // Preserve the visible column alias so the result column names match what the
@@ -995,12 +985,30 @@ bool ExecutePushdown(JOIN *join, Query_result *qr) {
   count_field_types(join->query_block, &tmp_param, visible,
                     /*reset_with_sum_func=*/false, /*save_sum_fields=*/true);
   tmp_param.skip_create_table = true;  // only Field buffers, not storage
+  // TMP_TABLE_ALL_COLUMNS forces exactly one result field per visible item,
+  // regardless of aggregation. Without it, create_tmp_table skips a field for any
+  // item that aggregates but is not a bare Item_sum (e.g. post-aggregation
+  // arithmetic `100*sum(x)/sum(y)`): it routes such items to outer_sum_func_count
+  // and sets store_column=false, so visible_field_ptr() ends up shorter than
+  // `visible` and vf[i] reads out of bounds. The aggregation is already computed
+  // by DuckDB — we only need a typed slot per output column to fill ourselves, so
+  // the all-columns mode is exactly right here (it also leaves the original query
+  // items unmodified).
   TABLE *table = create_tmp_table(thd, &tmp_param, visible, /*group=*/nullptr,
                                   /*distinct=*/false, /*save_sum_fields=*/true,
-                                  thd->variables.option_bits, HA_POS_ERROR,
-                                  "duckdb_pushdown");
+                                  thd->variables.option_bits | TMP_TABLE_ALL_COLUMNS,
+                                  HA_POS_ERROR, "duckdb_pushdown");
   if (table == nullptr) {
     RaiseDuckDBError("pushdown temp table failed");
+    return true;
+  }
+  // Defensive: the staging logic below indexes vf[0..visible.size()); a shorter
+  // field array would read out of bounds. With TMP_TABLE_ALL_COLUMNS this holds,
+  // but verify rather than trust.
+  if (table->visible_field_count() != visible.size()) {
+    close_tmp_table(table);
+    free_tmp_table(table);
+    RaiseDuckDBError("pushdown staging field-count mismatch");
     return true;
   }
   // Canonical teardown: close_tmp_table() drops the storage handler (create_tmp_table
