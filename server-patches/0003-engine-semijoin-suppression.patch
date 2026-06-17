@@ -1,0 +1,55 @@
+diff --git a/sql/sql_select.cc b/sql/sql_select.cc
+index ae19e18c3..3651b3285 100644
+--- a/sql/sql_select.cc
++++ b/sql/sql_select.cc
+@@ -578,6 +578,50 @@ bool Sql_cmd_dml::prepare(THD *thd) {
+     goto err; /* purecov: inspected */
+ 
+   {
++    // ENGINE PUSHDOWN (semijoin suppression). When every base table of this
++    // statement belongs to ONE storage engine offering whole-query pushdown
++    // (handlerton::pushdown_select != nullptr), disable semijoin flattening for
++    // this statement's resolve phase. That keeps IN/EXISTS subquery predicates
++    // intact as Item_in_subselect/Item_exists_subselect in the WHERE clause
++    // (rather than being flattened into semijoin nests, or hidden behind a
++    // materialization temp table), so the engine's pushdown builder can render
++    // them as native IN/EXISTS SQL. RAII-scoped over prepare_inner; restores
++    // optimizer_switch on every exit path (including `goto err`, which leaves
++    // this block and runs the destructor). Declared INSIDE this block so the
++    // `err:` label is not in its scope (a goto must not cross its init).
++    // Semantically transparent: if pushdown ultimately declines, the query still
++    // executes correctly on the row path — turning semijoin off only changes the
++    // plan, never the result set.
++    struct Pushdown_semijoin_guard {
++      THD *m_thd;
++      ulonglong m_saved{0};
++      bool m_active{false};
++      explicit Pushdown_semijoin_guard(THD *thd) : m_thd(thd) {
++        const handlerton *common = nullptr;
++        bool single = false;
++        for (Table_ref *tr = thd->lex->query_tables; tr != nullptr;
++             tr = tr->next_global) {
++          if (tr->table == nullptr || tr->table->file == nullptr) continue;
++          const handlerton *ht = tr->table->file->ht;
++          if (common == nullptr) {
++            common = ht;
++            single = true;
++          } else if (common != ht) {
++            single = false;
++            break;
++          }
++        }
++        if (single && common != nullptr && common->pushdown_select != nullptr) {
++          m_saved = m_thd->variables.optimizer_switch;
++          m_thd->variables.optimizer_switch &= ~OPTIMIZER_SWITCH_SEMIJOIN;
++          m_active = true;
++        }
++      }
++      ~Pushdown_semijoin_guard() {
++        if (m_active) m_thd->variables.optimizer_switch = m_saved;
++      }
++    } pushdown_semijoin_guard(thd);
++
+     const Prepare_error_tracker tracker(thd);
+     const Prepared_stmt_arena_holder ps_arena_holder(thd);
+     const Enable_derived_merge_guard derived_merge_guard(

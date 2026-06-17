@@ -304,7 +304,12 @@ bool RenderFieldBare(Item *it, std::string *out, CollationMap *cm_out) {
 }
 
 bool RenderExpr(BuildCtx *ctx, Item *it, std::string *out);
-bool RenderQueryBlock(BuildCtx *ctx, Query_block *qb, std::string *out);
+// strip_outer_top: when true, drop top-level conjuncts of THIS block's WHERE and
+// HAVING that reference outer tables (the IN→EXISTS-injected correlation). Used
+// only for an IN subquery's inner block to recover the original uncorrelated
+// subquery; not propagated into nested blocks (legitimate correlations survive).
+bool RenderQueryBlock(BuildCtx *ctx, Query_block *qb, std::string *out,
+                      bool strip_outer_top = false);
 bool RenderPredicate(BuildCtx *ctx, Item *cond, std::string *out);
 bool RenderCase(BuildCtx *ctx, Item_func *fn, std::string *out);
 
@@ -516,6 +521,124 @@ bool RenderExpr(BuildCtx *ctx, Item *it, std::string *out) {
 
 bool RenderPredicate(BuildCtx *ctx, Item *cond, std::string *out);
 
+// An IN→EXISTS-injected guard conjunct: when the server suppresses semijoin
+// flattening (engine pushdown), MySQL still rewrites an IN predicate during
+// prepare by AND-ing a correlation condition into the inner block's WHERE/HAVING
+// wrapped in Item_func_trig_cond(OUTER_FIELD_IS_NOT_NULL). We render the inner
+// subquery as a native DuckDB IN/EXISTS instead, so these injected conjuncts
+// must be stripped to recover the user's original inner predicate. Only this
+// trig-cond flavor is strippable; outer-join trig conds (FOUND_MATCH /
+// IS_NOT_NULL_COMPL) carry real semantics and are NOT stripped (we decline on
+// them elsewhere). Top-level (non-subquery) blocks never carry in2exists guards.
+bool IsStrippableTrigCond(Item *it) {
+  if (it == nullptr) return false;
+  Item *r = it->real_item();
+  if (r == nullptr || r->type() != Item::FUNC_ITEM) return false;
+  auto *fn = down_cast<Item_func *>(r);
+  if (fn->functype() != Item_func::TRIG_COND_FUNC) return false;
+  auto *tc = down_cast<Item_func_trig_cond *>(fn);
+  return tc->get_trig_type() == Item_func_trig_cond::OUTER_FIELD_IS_NOT_NULL;
+}
+
+// Render an IN/EXISTS subquery predicate as native DuckDB SQL:
+//   EXISTS   → "EXISTS (<inner>)"           (inner block left intact by MySQL)
+//   IN       → "(<left> IN (<inner>))"      (inner block has in2exists guards
+//                                            stripped via RenderQueryBlock)
+// `negated` wraps the whole thing in NOT (NOT IN / NOT EXISTS). DuckDB's IN/
+// NOT IN subquery operators implement SQL-standard three-valued NULL logic
+// identical to MySQL, so rendering the ORIGINAL (un-rewritten) IN is correct
+// including NULLs — which is why we strip the in2exists guards rather than
+// rendering MySQL's correlated-EXISTS rewrite (which would lose IN NULL
+// semantics). Correlated inner column refs render table-qualified and resolve
+// outward in DuckDB exactly as in MySQL (same basis as scalar subqueries).
+bool RenderSubqueryPredicate(BuildCtx *ctx, Item_subselect *ss, bool negated,
+                             std::string *out) {
+  if (ss == nullptr) return false;
+  const Item_subselect::Subquery_type st = ss->subquery_type();
+  if (st != Item_subselect::EXISTS_SUBQUERY &&
+      st != Item_subselect::IN_SUBQUERY)
+    return false;  // ALL/ANY/scalar/row: not handled here
+  // MySQL records NOT IN / NOT EXISTS as a value_transform on the subselect, NOT
+  // as an Item_func_not wrapper. Both Item_in_subselect and Item_exists_subselect
+  // derive from Item_exists_subselect, which holds it. By the post-optimize hook
+  // the predicate's WHERE-context test has been normalised: a plain IN/EXISTS is
+  // BOOL_IS_TRUE (or BOOL_IDENTITY pre-normalisation) and NOT IN/NOT EXISTS is
+  // BOOL_IS_FALSE (or BOOL_NEGATED). Fold into `negated`. "x NOT IN (subq)" keeps
+  // exactly the rows where the IN test is FALSE — identical 3-valued NULL handling
+  // in DuckDB's native NOT IN — so this is correct including NULLs. Any other
+  // transform (IS [NOT] UNKNOWN, IS NOT TRUE/FALSE, constant-folded) has different
+  // NULL semantics we do not model: decline.
+  switch (down_cast<Item_exists_subselect *>(ss)->value_transform) {
+    case Item::BOOL_IS_TRUE:
+    case Item::BOOL_IDENTITY:
+      break;  // positive
+    case Item::BOOL_IS_FALSE:
+    case Item::BOOL_NEGATED:
+      negated = !negated;  // NOT IN / NOT EXISTS
+      break;
+    default:
+      return false;
+  }
+  Query_expression *qe = ss->query_expr();
+  if (qe == nullptr || qe->query_term() == nullptr || !qe->is_simple())
+    return false;  // UNION/set-op subquery
+  Query_block *inner = qe->first_query_block();
+  if (inner == nullptr || inner->next_query_block() != nullptr) return false;
+
+  if (st == Item_subselect::EXISTS_SUBQUERY) {
+    // EXISTS is left intact by MySQL (no IN→EXISTS rewrite): render its inner
+    // block verbatim, including any legitimate correlation (do NOT strip).
+    std::string sub;
+    if (!RenderQueryBlock(ctx, inner, &sub)) return false;
+    *out = (negated ? "(NOT EXISTS (" : "(EXISTS (") + sub + "))";
+    return true;
+  }
+  // IN_SUBQUERY: strip the IN→EXISTS-injected correlation from the inner block's
+  // top-level WHERE/HAVING to recover the original uncorrelated subquery, then
+  // render "<left> [NOT] IN (<inner>)".
+  std::string sub;
+  if (!RenderQueryBlock(ctx, inner, &sub, /*strip_outer_top=*/true)) return false;
+  auto *in_ss = down_cast<Item_in_subselect *>(ss);
+  std::string left;
+  if (in_ss->left_expr == nullptr || !RenderExpr(ctx, in_ss->left_expr, &left))
+    return false;
+  *out = "(" + left + (negated ? " NOT IN (" : " IN (") + sub + "))";
+  return true;
+}
+
+// Diagnostic: print a WHERE/HAVING Item tree (types/functypes/subquery kinds)
+// so an un-renderable predicate can be identified. Gated on DUCKSDB_PD_TIMING.
+void DumpItemTree(Item *it, int depth) {
+  if (it == nullptr) return;
+  Item *r = it->real_item();
+  if (r == nullptr) return;
+  std::string indent(static_cast<size_t>(depth) * 2, ' ');
+  if (r->type() == Item::COND_ITEM) {
+    auto *c = down_cast<Item_cond *>(r);
+    fprintf(stderr, "[pd-tree] %sCOND %s\n", indent.c_str(),
+            c->functype() == Item_func::COND_AND_FUNC ? "AND" : "OR");
+    for (Item &child : *c->argument_list()) DumpItemTree(&child, depth + 1);
+    return;
+  }
+  if (r->type() == Item::FUNC_ITEM) {
+    auto *fn = down_cast<Item_func *>(r);
+    fprintf(stderr, "[pd-tree] %sFUNC functype=%d name=%s argc=%u\n",
+            indent.c_str(), static_cast<int>(fn->functype()), fn->func_name(),
+            fn->argument_count());
+    for (uint i = 0; i < fn->argument_count(); ++i)
+      DumpItemTree(fn->arguments()[i], depth + 1);
+    return;
+  }
+  if (r->type() == Item::SUBQUERY_ITEM) {
+    auto *ss = down_cast<Item_subselect *>(r);
+    fprintf(stderr, "[pd-tree] %sSUBQUERY subtype=%d\n", indent.c_str(),
+            static_cast<int>(ss->subquery_type()));
+    return;
+  }
+  fprintf(stderr, "[pd-tree] %sITEM type=%d\n", indent.c_str(),
+          static_cast<int>(r->type()));
+}
+
 const char *CmpOpName(Item_func::Functype f, bool flip) {
   switch (f) {
     case Item_func::EQ_FUNC:
@@ -675,6 +798,13 @@ bool RenderPredicate(BuildCtx *ctx, Item *cond, std::string *out) {
   Item *r = cond->real_item();
   if (r == nullptr) return false;
 
+  // A lone in2exists guard as the entire condition (the user's original
+  // predicate was empty) renders to TRUE — i.e. an absent WHERE/HAVING.
+  if (IsStrippableTrigCond(r)) {
+    *out = "TRUE";
+    return true;
+  }
+
   if (r->type() == Item::COND_ITEM) {
     auto *c = down_cast<Item_cond *>(r);
     const bool is_and = c->functype() == Item_func::COND_AND_FUNC;
@@ -686,15 +816,32 @@ bool RenderPredicate(BuildCtx *ctx, Item *cond, std::string *out) {
     // EXACT (it replaces the query, not just prunes rows): every conjunct/
     // disjunct must render or the whole predicate declines.
     for (Item &child : *c->argument_list()) {
+      // Strip IN→EXISTS-injected guard conjuncts (only in an AND): we render the
+      // inner subquery as a native IN/EXISTS, so the guard must not appear.
+      if (is_and && IsStrippableTrigCond(&child)) continue;
       std::string part;
       if (!RenderPredicate(ctx, &child, &part)) return false;
       if (!first) acc += is_and ? " AND " : " OR ";
       acc += part;
       first = false;
     }
-    if (first) return false;
+    if (first) {
+      // Every conjunct was a stripped guard → the original AND was empty → TRUE.
+      if (is_and) {
+        *out = "TRUE";
+        return true;
+      }
+      return false;  // empty OR: shouldn't happen; decline defensively
+    }
     *out = "(" + acc + ")";
     return true;
+  }
+
+  // IN/EXISTS subquery predicate appearing bare in the WHERE (semijoin
+  // suppression keeps it here instead of flattening it into the join).
+  if (r->type() == Item::SUBQUERY_ITEM) {
+    return RenderSubqueryPredicate(ctx, down_cast<Item_subselect *>(r),
+                                   /*negated=*/false, out);
   }
 
   if (r->type() == Item::FUNC_ITEM) {
@@ -732,6 +879,16 @@ bool RenderPredicate(BuildCtx *ctx, Item *cond, std::string *out) {
         return true;
       }
       default:
+        // Item_in_optimizer wraps an Item_in_subselect for "x IN (subquery)".
+        // It does not override functype() (lands here); detect it structurally
+        // by its single subquery argument and render as a native IN.
+        if (fn->argument_count() == 1 && fn->arguments()[0] != nullptr &&
+            fn->arguments()[0]->real_item() != nullptr &&
+            fn->arguments()[0]->real_item()->type() == Item::SUBQUERY_ITEM) {
+          return RenderSubqueryPredicate(
+              ctx, down_cast<Item_subselect *>(fn->arguments()[0]->real_item()),
+              /*negated=*/false, out);
+        }
         return false;
     }
   }
@@ -793,7 +950,8 @@ bool RenderSelectItem(BuildCtx *ctx, Item *it, std::string *out) {
   return true;
 }
 
-bool RenderQueryBlock(BuildCtx *ctx, Query_block *qb, std::string *out);
+bool RenderQueryBlock(BuildCtx *ctx, Query_block *qb, std::string *out,
+                      bool strip_outer_top);
 
 bool RenderJoinList(BuildCtx *ctx, const mem_root_deque<Table_ref *> &tables,
                     std::string *out);
@@ -875,7 +1033,12 @@ bool RenderJoinList(BuildCtx *ctx, const mem_root_deque<Table_ref *> &tables,
   std::string sql;
   bool first = true;
   for (Table_ref *t : ts) {
-    if (t->is_sj_nest() || t->is_aj_nest()) return false;  // semi/anti: decline
+    // SEMI/ANTI-join nests should no longer reach here: the server patch
+    // disables semijoin flattening for single-pushdown-engine statements, so
+    // IN/EXISTS predicates survive in the WHERE (rendered structurally) rather
+    // than being flattened into the join tree. Decline defensively if one ever
+    // appears (e.g. a hint forced semijoin on).
+    if (t->is_sj_nest() || t->is_aj_nest()) return false;
     std::string ref;
     if (t->nested_join != nullptr) {
       std::string inner;
@@ -934,13 +1097,60 @@ bool RenderFrom(BuildCtx *ctx, Query_block *qb, std::string *out) {
   return true;
 }
 
+// Render a WHERE/HAVING condition, dropping the TOP-LEVEL conjuncts that
+// reference an outer table (OUTER_REF_TABLE_BIT). For an IN subquery's inner
+// block, MySQL's IN→EXISTS rewrite injects a correlation equality between the
+// inner SELECT expression and the outer left_expr; that injected conjunct (and
+// only it, since a renderable IN subquery's original body is uncorrelated)
+// references the outer query, so stripping outer-referencing top-level conjuncts
+// recovers the user's original predicate. Works whether the injection is a bare
+// equality or wrapped in Item_func_trig_cond (the optimizer drops the trig_cond
+// wrapper when the outer field is non-nullable). Stripping is TOP-LEVEL ONLY:
+// nested conditions (e.g. a correlated scalar subquery inside the inner block)
+// render via RenderPredicate unchanged, so legitimate correlations survive. If
+// every conjunct is stripped the result is "TRUE" (no effective WHERE/HAVING).
+bool RenderCondStripOuterTop(BuildCtx *ctx, Item *cond, std::string *out) {
+  if (cond == nullptr) return false;
+  Item *r = cond->real_item();
+  if (r == nullptr) return false;
+  // A single non-AND condition that is itself the injected correlation.
+  const bool is_and = r->type() == Item::COND_ITEM &&
+                      down_cast<Item_cond *>(r)->functype() ==
+                          Item_func::COND_AND_FUNC;
+  if (!is_and) {
+    if ((r->used_tables() & OUTER_REF_TABLE_BIT) != 0) {
+      *out = "TRUE";
+      return true;
+    }
+    return RenderPredicate(ctx, r, out);
+  }
+  auto *c = down_cast<Item_cond *>(r);
+  std::string acc;
+  bool first = true;
+  for (Item &child : *c->argument_list()) {
+    if ((child.used_tables() & OUTER_REF_TABLE_BIT) != 0) continue;  // injected
+    std::string part;
+    if (!RenderPredicate(ctx, &child, &part)) return false;
+    if (!first) acc += " AND ";
+    acc += part;
+    first = false;
+  }
+  if (first) {
+    *out = "TRUE";
+    return true;
+  }
+  *out = "(" + acc + ")";
+  return true;
+}
+
 // Assemble one complete, parenthesizable SELECT for the given query block:
 // SELECT list + FROM + WHERE + GROUP BY + HAVING + ORDER BY + LIMIT. Reads the
 // PASSED qb (never ctx->qb), so it is reusable for the top block and for any
 // derived (inline-view) sub-block via RenderFrom. Returns false (decline) on any
 // unsupported node; the shared ctx threads params and the single-schema guard
-// through every nested block.
-bool RenderQueryBlock(BuildCtx *ctx, Query_block *qb, std::string *out) {
+// through every nested block. strip_outer_top: see the forward declaration.
+bool RenderQueryBlock(BuildCtx *ctx, Query_block *qb, std::string *out,
+                      bool strip_outer_top) {
   auto decline = [](const char *why) -> bool {
     if (PdTiming()) {
       fprintf(stderr, "[pd-decline-at] %s\n", why);
@@ -975,8 +1185,16 @@ bool RenderQueryBlock(BuildCtx *ctx, Query_block *qb, std::string *out) {
   // WHERE.
   if (Item *w = qb->where_cond()) {
     std::string where_sql;
-    if (!RenderPredicate(ctx, w, &where_sql)) return decline("where");
-    sql += " WHERE " + where_sql;
+    const bool ok = strip_outer_top ? RenderCondStripOuterTop(ctx, w, &where_sql)
+                                    : RenderPredicate(ctx, w, &where_sql);
+    if (!ok) {
+      if (PdTiming()) DumpItemTree(w, 0);
+      return decline("where");
+    }
+    // A WHERE that renders to just "TRUE" (all conjuncts were stripped guards)
+    // is equivalent to no WHERE — omit it for cleaner SQL.
+    if (where_sql != "TRUE" && where_sql != "(TRUE)")
+      sql += " WHERE " + where_sql;
   }
 
   // GROUP BY. DuckDB requires EVERY non-aggregated SELECT column to appear in
@@ -1011,11 +1229,18 @@ bool RenderQueryBlock(BuildCtx *ctx, Query_block *qb, std::string *out) {
     if (!keys.empty()) sql += " GROUP BY " + group_sql;
   }
 
-  // HAVING.
+  // HAVING. (An IN→EXISTS guard on a grouped IN subquery lands here; once
+  // stripped the HAVING may render to TRUE, i.e. no real HAVING — omit it.)
   if (Item *h = qb->having_cond()) {
     std::string having_sql;
-    if (!RenderPredicate(ctx, h, &having_sql)) return decline("having");
-    sql += " HAVING " + having_sql;
+    const bool ok = strip_outer_top ? RenderCondStripOuterTop(ctx, h, &having_sql)
+                                    : RenderPredicate(ctx, h, &having_sql);
+    if (!ok) {
+      if (PdTiming()) DumpItemTree(h, 0);
+      return decline("having");
+    }
+    if (having_sql != "TRUE" && having_sql != "(TRUE)")
+      sql += " HAVING " + having_sql;
   }
 
   // ORDER BY with ASC/DESC.
