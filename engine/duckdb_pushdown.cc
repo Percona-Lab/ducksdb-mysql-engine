@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -28,6 +29,7 @@
 #include "sql/item_sum.h"
 #include "sql/item_subselect.h"  // Item_subselect (scalar subqueries)
 #include "sql/item_timefunc.h"   // Item_extract (EXTRACT)
+#include "sql/nested_join.h"     // NESTED_JOIN (outer-join FROM tree)
 #include "sql/query_options.h"  // TMP_TABLE_ALL_COLUMNS
 #include "sql/query_result.h"
 #include "sql/sql_class.h"
@@ -717,6 +719,18 @@ bool RenderPredicate(BuildCtx *ctx, Item *cond, std::string *out) {
         return RenderNullTest(ctx, fn, false, out);
       case Item_func::MULTI_EQ_FUNC:
         return RenderMultiEq(ctx, down_cast<Item_multi_eq *>(fn), out);
+      case Item_func::NOT_FUNC: {
+        // Generic negation: NOT (<pred>). Three-valued-logic semantics are
+        // identical in MySQL and DuckDB, so this is exact whenever the inner
+        // predicate renders (e.g. NOT LIKE in TPC-H Q13's join ON). A NOT over a
+        // subquery (NOT IN / NOT EXISTS) declines because the inner subselect
+        // declines — antijoins stay unsupported until handled explicitly.
+        if (fn->argument_count() != 1) return false;
+        std::string inner;
+        if (!RenderPredicate(ctx, fn->arguments()[0], &inner)) return false;
+        *out = "(NOT " + inner + ")";
+        return true;
+      }
       default:
         return false;
     }
@@ -781,80 +795,137 @@ bool RenderSelectItem(BuildCtx *ctx, Item *it, std::string *out) {
 
 bool RenderQueryBlock(BuildCtx *ctx, Query_block *qb, std::string *out);
 
-// FROM list: comma-separated entries from the block's leaf table list. Iterating
-// leaf_tables (not next_local) is what makes MERGED derived tables transparent:
-// when MySQL merges an inline view into its parent (the common case for a derived
-// table with no aggregation, e.g. TPC-H Q9's `profit` view), the parent block's
-// leaf_tables already holds the inner base tables directly and the outer SELECT/
-// WHERE/GROUP BY have been rewritten to reference those base columns — so this
-// renders exactly the flat join with NO derived syntax needed. A MATERIALIZED
-// derived table (not merged) instead appears as a single leaf whose `table` is the
-// materialization temp table; that leaf is rendered as a parenthesized sub-select.
-//
-// Base ENGINE=DuckDB tables render as "name" [AS alias]; a materialized derived
-// table renders as "(<inner select>) AS alias". Inner joins are a cross product +
-// WHERE conjunct (DuckDB treats this as an inner join). Outer joins / nested-join
-// trees are out of scope and decline. For a flat single-block query the leaf list
-// is exactly the base tables, so existing single-block queries are unaffected.
+bool RenderJoinList(BuildCtx *ctx, const mem_root_deque<Table_ref *> &tables,
+                    std::string *out);
+
+// Render one base or materialized-derived table reference (no join operator).
+// Base ENGINE=DuckDB tables → "name" [AS alias] (with the single-schema/engine
+// guards); a materialized (un-merged) inline view → "(<inner select>) AS alias".
+// A MERGED derived table never reaches here as a derived leaf — its base tables
+// are the leaves instead (so MERGED views render transparently as a flat join).
+bool RenderTableRef(BuildCtx *ctx, Table_ref *tr, std::string *out) {
+  if (tr->is_derived() && !tr->is_merged()) {
+    Query_expression *du = tr->derived_query_expression();
+    if (du == nullptr) return false;
+    if (du->query_term() == nullptr || !du->is_simple()) return false;
+    Query_block *inner_qb = du->first_query_block();
+    if (inner_qb == nullptr || inner_qb->next_query_block() != nullptr)
+      return false;
+    if (du->m_lateral_deps != 0 || inner_qb->is_dependent()) return false;
+    const char *alias = tr->alias;
+    if (alias == nullptr || alias[0] == '\0') return false;
+    std::string inner;
+    if (!RenderQueryBlock(ctx, inner_qb, &inner)) return false;
+    std::string ref = "(" + inner + ") AS " + QuoteIdent(alias);
+    // A derived table may rename its output columns, e.g. `... AS d (a, b)`
+    // (TPC-H Q13: `c_orders (c_custkey, c_count)`). The inner SELECT items keep
+    // their own names, so emit the rename explicitly as `AS alias (c1, c2, …)`
+    // (DuckDB renames positionally) — otherwise the outer block's references to
+    // the renamed columns would not resolve.
+    const Create_col_name_list *cols = tr->derived_column_names();
+    if (cols != nullptr && !cols->empty()) {
+      std::string cl;
+      for (size_t i = 0; i < cols->size(); ++i) {
+        if (i != 0) cl += ", ";
+        cl += QuoteIdent(std::string((*cols)[i].str, (*cols)[i].length));
+      }
+      ref += " (" + cl + ")";
+    }
+    *out = ref;
+    return true;
+  }
+  TABLE *table = tr->table;
+  if (table == nullptr || table->s == nullptr) return false;
+  if (table->s->db_type() != ducksdb_hton) return false;
+  if (ctx->db == nullptr) {
+    ctx->db = table->s->db.str;
+    ctx->dblen = table->s->db.length;
+  } else if (table->s->db.length != ctx->dblen ||
+             memcmp(ctx->db, table->s->db.str, ctx->dblen) != 0) {
+    return false;  // cross-schema join — different DuckDB files
+  }
+  const char *name = tr->table_name != nullptr ? tr->table_name : "";
+  std::string ref = QuoteIdent(name);
+  if (tr->alias != nullptr && tr->alias[0] != '\0' &&
+      std::strcmp(tr->alias, name) != 0) {
+    ref += " AS " + QuoteIdent(tr->alias);
+  }
+  *out = ref;
+  return true;
+}
+
+// Render a join nest as DuckDB SQL, mirroring the server's print_join: the join
+// list is stored reversed, so reverse it, then emit the first table followed by
+// each subsequent table with its operator. LEFT joins render as
+// "<l> LEFT JOIN <r> ON (<cond>)" (MySQL converts RIGHT→LEFT); a nested join
+// recurses parenthesized; cross/inner members (their condition moved to WHERE by
+// the optimizer) join with a comma; an inner table that still carries an ON cond
+// (e.g. from view merge) renders "JOIN <r> ON (<cond>)". SEMI/ANTI-join nests
+// decline (handled by a later construct). Uses join_cond_optim() — the
+// post-optimize ON condition live at the pushdown hook.
+bool RenderJoinList(BuildCtx *ctx, const mem_root_deque<Table_ref *> &tables,
+                    std::string *out) {
+  std::vector<Table_ref *> ts;
+  for (Table_ref *t : tables)
+    if (t != nullptr && t->alias != nullptr && t->alias[0] != '\0')
+      ts.push_back(t);
+  if (ts.empty()) return false;
+  std::reverse(ts.begin(), ts.end());
+
+  std::string sql;
+  bool first = true;
+  for (Table_ref *t : ts) {
+    if (t->is_sj_nest() || t->is_aj_nest()) return false;  // semi/anti: decline
+    std::string ref;
+    if (t->nested_join != nullptr) {
+      std::string inner;
+      if (!RenderJoinList(ctx, t->nested_join->m_tables, &inner)) return false;
+      ref = "(" + inner + ")";
+    } else if (!RenderTableRef(ctx, t, &ref)) {
+      return false;
+    }
+    Item *cond = t->join_cond_optim();
+    if (cond == reinterpret_cast<Item *>(1)) return false;  // unresolved sentinel
+    if (first) {
+      if (cond != nullptr) return false;  // ON on the first table: can't place
+      sql = ref;
+    } else if (t->outer_join) {
+      if (cond == nullptr) return false;  // an outer join must have an ON
+      std::string c;
+      if (!RenderPredicate(ctx, cond, &c)) return false;
+      sql += " LEFT JOIN " + ref + " ON (" + c + ")";
+    } else if (cond != nullptr) {
+      std::string c;
+      if (!RenderPredicate(ctx, cond, &c)) return false;
+      sql += " JOIN " + ref + " ON (" + c + ")";
+    } else {
+      sql += ", " + ref;  // cross / inner (condition is in WHERE)
+    }
+    first = false;
+  }
+  *out = sql;
+  return true;
+}
+
+// FROM clause. With no outer joins, render the flat comma list over leaf_tables
+// (inner-join conditions live in WHERE; this also makes MERGED derived tables
+// transparent — their base tables are the leaves). When the block contains an
+// outer join, render the join nest tree instead so LEFT JOIN ... ON is emitted
+// with correct NULL-extension semantics.
 bool RenderFrom(BuildCtx *ctx, Query_block *qb, std::string *out) {
+  bool has_outer = false;
+  for (Table_ref *tr = qb->leaf_tables; tr != nullptr; tr = tr->next_leaf) {
+    if (tr->outer_join != 0 || tr->is_inner_table_of_outer_join()) {
+      has_outer = true;
+      break;
+    }
+  }
+  if (has_outer) return RenderJoinList(ctx, qb->m_table_nest, out);
+
   std::string from;
   for (Table_ref *tr = qb->leaf_tables; tr != nullptr; tr = tr->next_leaf) {
-    // Outer joins change NULL-extension semantics; decline.
-    if (tr->outer_join != 0 || tr->is_inner_table_of_outer_join())
-      return false;
-
-    // Materialized derived table (an un-merged inline view): render its inner
-    // query block as a parenthesized sub-select. A MERGED derived table never
-    // reaches here as a derived leaf — its base tables are the leaves instead, so
-    // we only special-case the non-merged form. is_merged() distinguishes them
-    // (effective_algorithm == VIEW_ALGORITHM_MERGE). Views (is_derived() false)
-    // and other refs fall through to the base-table path, which declines on a null
-    // TABLE.
-    if (tr->is_derived() && !tr->is_merged()) {
-      Query_expression *du = tr->derived_query_expression();
-      if (du == nullptr) return false;
-      // Only a simple single query block (no UNION/EXCEPT/INTERSECT). is_simple()
-      // dereferences m_query_term unconditionally, so guard it first.
-      if (du->query_term() == nullptr || !du->is_simple()) return false;
-      Query_block *inner_qb = du->first_query_block();
-      if (inner_qb == nullptr || inner_qb->next_query_block() != nullptr)
-        return false;
-      // Correlated / LATERAL derived tables reference outer columns inside the
-      // inner block; rendered as a standalone "(SELECT …) AS alias" those refs
-      // would bind wrong (or only error at DuckDB execution). Decline
-      // deterministically rather than rely on DuckDB to reject it.
-      if (du->m_lateral_deps != 0 || inner_qb->is_dependent()) return false;
-      const char *alias = tr->alias;
-      if (alias == nullptr || alias[0] == '\0') return false;  // need a name to qualify
-      std::string inner;
-      // The inner block's own tables are validated by the recursive RenderFrom
-      // (same ctx → shared single-schema + ENGINE=DuckDB guards).
-      if (!RenderQueryBlock(ctx, inner_qb, &inner)) return false;
-      std::string ref = "(" + inner + ") AS " + QuoteIdent(alias);
-      if (!from.empty()) from += ", ";
-      from += ref;
-      continue;
-    }
-
-    TABLE *table = tr->table;
-    if (table == nullptr || table->s == nullptr) return false;
-    if (table->s->db_type() != ducksdb_hton) return false;
-    // Single-schema guard.
-    if (ctx->db == nullptr) {
-      ctx->db = table->s->db.str;
-      ctx->dblen = table->s->db.length;
-    } else if (table->s->db.length != ctx->dblen ||
-               memcmp(ctx->db, table->s->db.str, ctx->dblen) != 0) {
-      return false;  // cross-schema join — different DuckDB files
-    }
-    const char *name = tr->table_name != nullptr ? tr->table_name : "";
-    std::string ref = QuoteIdent(name);
-    // Carry an alias when the table was aliased (so qualified column refs in the
-    // select/where resolve to the same name we render here).
-    if (tr->alias != nullptr && tr->alias[0] != '\0' &&
-        std::strcmp(tr->alias, name) != 0) {
-      ref += " AS " + QuoteIdent(tr->alias);
-    }
+    std::string ref;
+    if (!RenderTableRef(ctx, tr, &ref)) return false;
     if (!from.empty()) from += ", ";
     from += ref;
   }
