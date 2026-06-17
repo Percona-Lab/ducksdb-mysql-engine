@@ -1019,7 +1019,14 @@ bool BuildPushdownSQLBuilder(const THD *thd, JOIN *join, std::string *db_out,
   // params; must be (implicitly) grouped to be a worthwhile offload candidate.
   Query_expression *unit = qb->master_query_expression();
   if (unit == nullptr || !unit->is_simple()) return decline("not-simple/union");
-  if (!(qb->is_grouped() || qb->is_implicitly_grouped())) return decline("not-grouped");
+  // Offload aggregate/grouped queries, and non-aggregate queries that carry an
+  // explicit LIMIT — the LIMIT bounds the staged result (so we never stream a
+  // huge non-aggregate scan) and excludes bare point lookups (no LIMIT), which
+  // stay on the fast row path. This admits analytical non-aggregate joins like
+  // TPC-H Q2 (5-table join + correlated scalar + LIMIT 100).
+  if (!(qb->is_grouped() || qb->is_implicitly_grouped()) &&
+      qb->select_limit == nullptr)
+    return decline("not-grouped");
   // NOTE: the former blanket `first_inner_query_expression() != nullptr` decline
   // is intentionally GONE — a derived table is a nested query expression, and we
   // now support it. Any unsupported nesting still declines downstream:
