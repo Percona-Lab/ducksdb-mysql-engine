@@ -443,6 +443,43 @@ bool RenderExtract(BuildCtx *ctx, Item_func *fn, std::string *out) {
   return true;
 }
 
+// SUBSTRING(str, pos[, len]) — Item_func_substr has no distinct functype, so the
+// caller detects it by func_name(). MySQL SUBSTRING and DuckDB substring() are
+// both 1-indexed with identical semantics, so this maps 1:1. The pos/len are
+// rendered as INLINE integer literals (not bound $N params): a constant bound as
+// a param gets a fresh placeholder on every render, so the same SUBSTRING would
+// produce different SQL text in SELECT vs GROUP BY vs ORDER BY — DuckDB then
+// rejects it ("column must appear in GROUP BY", TPC-H Q22). Inlining the small
+// integer args keeps the expression text identical everywhere. pos/len must be
+// integer constants (they are in practice); otherwise decline.
+bool RenderIntConst(Item *it, std::string *out) {
+  if (it == nullptr) return false;
+  Item *r = it->real_item();
+  if (r == nullptr || !r->const_item()) return false;
+  if (r->result_type() != INT_RESULT && r->result_type() != DECIMAL_RESULT)
+    return false;
+  const longlong v = r->val_int();
+  if (r->null_value) return false;
+  *out = std::to_string(v);
+  return true;
+}
+
+bool RenderSubstr(BuildCtx *ctx, Item_func *fn, std::string *out) {
+  const uint n = fn->argument_count();
+  if (n != 2 && n != 3) return false;
+  std::string s, pos;
+  if (!RenderExpr(ctx, fn->arguments()[0], &s)) return false;
+  if (!RenderIntConst(fn->arguments()[1], &pos)) return false;
+  if (n == 3) {
+    std::string len;
+    if (!RenderIntConst(fn->arguments()[2], &len)) return false;
+    *out = "substring(" + s + ", " + pos + ", " + len + ")";
+  } else {
+    *out = "substring(" + s + ", " + pos + ")";
+  }
+  return true;
+}
+
 bool RenderExpr(BuildCtx *ctx, Item *it, std::string *out) {
   if (it == nullptr) return false;
   Item *r = it->real_item();
@@ -486,6 +523,9 @@ bool RenderExpr(BuildCtx *ctx, Item *it, std::string *out) {
         case Item_func::EXTRACT_FUNC:
           return RenderExtract(ctx, fn, out);
         default:
+          // SUBSTRING(str, pos[, len]) has no distinct functype; detect by name.
+          if (std::strcmp(fn->func_name(), "substr") == 0)
+            return RenderSubstr(ctx, fn, out);
           return false;  // non-whitelisted scalar function: decline
       }
     }
@@ -1315,14 +1355,20 @@ bool BuildPushdownSQLBuilder(const THD *thd, JOIN *join, std::string *db_out,
   // params; must be (implicitly) grouped to be a worthwhile offload candidate.
   Query_expression *unit = qb->master_query_expression();
   if (unit == nullptr || !unit->is_simple()) return decline("not-simple/union");
-  // Offload aggregate/grouped queries, and non-aggregate queries that carry an
-  // explicit LIMIT — the LIMIT bounds the staged result (so we never stream a
-  // huge non-aggregate scan) and excludes bare point lookups (no LIMIT), which
-  // stay on the fast row path. This admits analytical non-aggregate joins like
-  // TPC-H Q2 (5-table join + correlated scalar + LIMIT 100).
+  // Offload aggregate/grouped queries, non-aggregate queries that carry an
+  // explicit LIMIT, and non-aggregate MULTI-TABLE joins. The LIMIT bounds the
+  // staged result, and a multi-table join is inherently analytical (DuckDB's
+  // vectorized join wins) — both are worthwhile offloads. We still decline a
+  // single-table non-grouped query with no LIMIT: that is a point lookup or full
+  // scan that is faster on the row path (index seek, no staging). This admits
+  // TPC-H Q2 (5-table join + LIMIT) and Q20 (2-table join + nested IN, no LIMIT).
   if (!(qb->is_grouped() || qb->is_implicitly_grouped()) &&
-      qb->select_limit == nullptr)
-    return decline("not-grouped");
+      qb->select_limit == nullptr) {
+    int nleaf = 0;
+    for (Table_ref *tr = qb->leaf_tables; tr != nullptr; tr = tr->next_leaf)
+      ++nleaf;
+    if (nleaf < 2) return decline("not-grouped");
+  }
   // NOTE: the former blanket `first_inner_query_expression() != nullptr` decline
   // is intentionally GONE — a derived table is a nested query expression, and we
   // now support it. Any unsupported nesting still declines downstream:

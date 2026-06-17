@@ -91,8 +91,9 @@ for n in $QUERIES; do
   out_d=$(timeout 120 "$MYSQL" --no-defaults -uroot --socket="$SOCK" -N duck -e "$sql" 2>/tmp/pdvd-q.err)
   rc=$?
   after=$(pc)
-  out_i=$(timeout 300 "$MYSQL" --no-defaults -uroot --socket="$SOCK" -N inno -e "$sql" 2>/dev/null)
+  out_i=$(timeout "${INNO_TIMEOUT:-300}" "$MYSQL" --no-defaults -uroot --socket="$SOCK" -N inno -e "$sql" 2>/dev/null)
   if [ $rc -ne 0 ]; then echo "Q$n: ENGINE rc=$rc"; tail -3 /tmp/pdvd-q.err; fi
+  if [ -n "${DUMP_DIR:-}" ]; then mkdir -p "$DUMP_DIR"; printf '%s' "$out_d" | sort > "$DUMP_DIR/q$n-duck.txt"; fi
   md_d=$(printf '%s' "$out_d" | sort | md5sum | awk '{print $1}')
   md_i=$(printf '%s' "$out_i" | sort | md5sum | awk '{print $1}')
   rows_d=$(printf '%s' "$out_d" | grep -c . )
