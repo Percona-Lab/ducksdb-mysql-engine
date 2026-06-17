@@ -495,7 +495,13 @@ bool RenderExpr(BuildCtx *ctx, Item *it, std::string *out) {
         return false;  // UNION/set-op subquery
       Query_block *inner = qe->first_query_block();
       if (inner == nullptr || inner->next_query_block() != nullptr) return false;
-      if (qe->m_lateral_deps != 0 || inner->is_dependent()) return false;  // correlated: defer
+      // Correlated scalar subqueries are allowed: an unqualified inner column
+      // resolves innermost-first in both MySQL and DuckDB, and outer references
+      // render as table-qualified names not present in the inner FROM (a correlated
+      // ref in DuckDB) — same semantics. (LATERAL deps would need the LATERAL
+      // keyword; none arise for a scalar subselect.) Correctness is gated by the
+      // md5 test, not by declining.
+      if (qe->m_lateral_deps != 0) return false;
       std::string sub;
       if (!RenderQueryBlock(ctx, inner, &sub)) return false;
       *out = "(" + sub + ")";
