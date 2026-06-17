@@ -18,7 +18,7 @@ The published image ships MySQL 9.7 with the DuckDB engine already built in — 
 build step and no plugin to load.
 
 ```sh
-docker pull evgeniypatlan/test-images:mysql-9.7-duckdb-v0.1.0
+docker pull evgeniypatlan/test-images:mysql-9.7-duckdb-v0.2.0
 ```
 
 Run it, publishing the MySQL port, setting a root password, and mounting a volume
@@ -29,7 +29,7 @@ docker run -d --name mysql-duckdb \
   -p 3306:3306 \
   -e MYSQL_ROOT_PASSWORD=secret \
   -v mysql-duckdb-data:/var/lib/mysql \
-  evgeniypatlan/test-images:mysql-9.7-duckdb-v0.1.0
+  evgeniypatlan/test-images:mysql-9.7-duckdb-v0.2.0
 ```
 
 Connect with any MySQL client:

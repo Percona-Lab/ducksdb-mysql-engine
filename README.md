@@ -21,7 +21,7 @@ A prebuilt image ships MySQL 9.7 with the engine already built in:
 docker run -d --name mysql-duckdb -p 3306:3306 \
   -e MYSQL_ROOT_PASSWORD=secret \
   -v mysql-duckdb-data:/var/lib/mysql \
-  evgeniypatlan/test-images:mysql-9.7-duckdb-v0.1.0
+  evgeniypatlan/test-images:mysql-9.7-duckdb-v0.2.0
 
 mysql -h 127.0.0.1 -u root -psecret -e "
   CREATE DATABASE shop; USE shop;
