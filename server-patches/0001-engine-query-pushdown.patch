@@ -40,16 +40,15 @@ index ca02975b5..9c749f12f 100644
      Pointer to a function that estimates the cost of executing a join in a
      secondary storage engine.
 diff --git a/sql/sql_optimizer.cc b/sql/sql_optimizer.cc
-index 0c919e005..b826c31b6 100644
 --- a/sql/sql_optimizer.cc
 +++ b/sql/sql_optimizer.cc
-@@ -341,6 +341,30 @@ bool JOIN::check_access_path_with_fts() const {
+@@ -341,6 +341,51 @@
    @retval false Success.
    @retval true Error, error code saved in member JOIN::error.
  */
 +
 +/**
-+  whole-query pushdown helper: return the common handlerton iff every
++  select_handler-style pushdown helper: return the common handlerton iff every
 +  base (leaf) table of the query block belongs to the SAME storage engine and
 +  there is at least one base table; otherwise nullptr. Used to offer whole-query
 +  pushdown to an engine (e.g. ENGINE=DuckDB) that implements
@@ -59,9 +58,30 @@ index 0c919e005..b826c31b6 100644
 +  const handlerton *common = nullptr;
 +  int n = 0;
 +  for (Table_ref *tr = qb->leaf_tables; tr != nullptr; tr = tr->next_leaf) {
-+    if (tr->is_derived() || tr->table == nullptr || tr->table->file == nullptr)
-+      return nullptr;  // conservative: only plain base tables
-+    const handlerton *ht = tr->table->file->ht;
++    const handlerton *ht = nullptr;
++    if (tr->is_derived()) {
++      // Look THROUGH a (materialized) derived table: its inner query block(s)
++      // must themselves resolve to the same single pushdown engine. Without this
++      // the helper bailed on any derived table, so the pushdown_select hook was
++      // never offered for a query whose FROM contains an inline view, even when
++      // every underlying base table is that engine.
++      Query_expression *u = tr->derived_query_expression();
++      if (u == nullptr) return nullptr;
++      for (Query_block *sb = u->first_query_block(); sb != nullptr;
++           sb = sb->next_query_block()) {
++        const handlerton *sub = single_engine_for_pushdown(sb);  // recurse
++        if (sub == nullptr) return nullptr;
++        if (ht == nullptr)
++          ht = sub;
++        else if (ht != sub)
++          return nullptr;  // mixed engines inside the derived table
++      }
++      if (ht == nullptr) return nullptr;  // empty derived: bail
++    } else {
++      if (tr->table == nullptr || tr->table->file == nullptr)
++        return nullptr;  // not a plain base table
++      ht = tr->table->file->ht;
++    }
 +    if (common == nullptr)
 +      common = ht;
 +    else if (common != ht)
@@ -74,11 +94,11 @@ index 0c919e005..b826c31b6 100644
  bool JOIN::optimize(bool finalize_access_paths) {
    DBUG_TRACE;
  
-@@ -1044,6 +1068,29 @@ bool JOIN::optimize(bool finalize_access_paths) {
+@@ -1044,6 +1089,29 @@
    if (make_join_readinfo(this, no_jbuf_after))
      return true; /* purecov: inspected */
  
-+  // EARLY whole-query pushdown: intercept BEFORE MySQL builds its own
++  // EARLY whole-query pushdown (lever-2): intercept BEFORE MySQL builds its own
 +  // GROUP BY/ORDER BY temp tables (make_tmp_tables_info) and the access-path tree
 +  // (create_access_paths) that the override executor would immediately discard.
 +  // If every base table belongs to one engine offering pushdown_select and it
