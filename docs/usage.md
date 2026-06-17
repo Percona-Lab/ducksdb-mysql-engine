@@ -208,9 +208,12 @@ offset are bound as parameters).
 SELECT id, sale_yr, region FROM sales WHERE id = 3;
 ```
 
-This is not an aggregate query, so the whole-query builder declines and the row is
-served through the normal handler read path. `Ducksdb_pushdown_count` does not
-change. The result is identical either way.
+This is a single-table, non-aggregated, no-`LIMIT` query — a point lookup — so the
+whole-query builder declines on purpose and the row is served through the normal
+handler read path (an index seek beats staging a result here).
+`Ducksdb_pushdown_count` does not change. The result is identical either way.
+Non-aggregate queries that *are* worth offloading — a multi-table join, or one
+with a `LIMIT` — do push down.
 
 ### EXPLAIN (always a normal plan)
 
@@ -270,24 +273,33 @@ Pushed down (when all base tables are `ENGINE=DuckDB` in one schema):
 
 - Aggregate queries (grouped or implicitly grouped): `COUNT`, `COUNT(*)`,
   `COUNT(DISTINCT)`, `SUM`, `SUM(DISTINCT)`, `AVG`, `AVG(DISTINCT)`, `MIN`, `MAX`.
+- Non-aggregate queries that are worth offloading: a multi-table join, or any
+  query with an explicit `LIMIT`.
 - `WHERE` predicates built from `=`, `<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`,
-  `IS NULL`, `IS NOT NULL`, combined with `AND` / `OR`.
-- Scalar arithmetic `+`, `-`, `*`, `/` in select / predicate operands.
+  `IS NULL`, `IS NOT NULL`, `NOT`, and `LIKE`, combined with `AND` / `OR`.
+- Scalar arithmetic `+`, `-`, `*`, `/`, searched `CASE`,
+  `EXTRACT(YEAR|QUARTER|MONTH|DAY)`, and `SUBSTRING` in select / predicate operands.
 - `GROUP BY`, `HAVING`, `ORDER BY` (with `ASC`/`DESC`), explicit `LIMIT`/`OFFSET`,
   and `DISTINCT`.
-- Inner joins within a single schema (rendered as cross product + `WHERE`).
-- Integer, `DECIMAL`, and `NULL` literals.
+- Inner joins (cross product + `WHERE`), outer joins (`LEFT JOIN … ON`),
+  materialized derived tables, and CTEs — all within a single schema.
+- Subqueries: scalar (correlated and uncorrelated), and `IN` / `EXISTS` /
+  `NOT IN` / `NOT EXISTS` predicates.
+- Integer, `DECIMAL`, optimizer-folded constant, temporal (e.g.
+  `CAST('1998-09-02' AS DATE)`), and `NULL` literals.
+
+All 22 standard TPC-H queries push down and return results identical to InnoDB.
 
 Declines to normal MySQL execution (always still correct):
 
-- Non-aggregate queries (plain row reads, point lookups).
-- `UNION`, subqueries, window functions, `ROLLUP`.
-- Outer joins, nested-join trees, and cross-schema joins (different `.duckdb`
-  files).
-- Any non-whitelisted function: string functions, date functions, `CASE` / `IF`,
-  `CAST`, `GROUP_CONCAT`, JSON aggregates, statistical aggregates, etc.
-- `REAL`/`DOUBLE`, string, and temporal literals (to avoid floating-point,
-  charset, and parse ambiguity).
+- Single-table non-aggregate, no-`LIMIT` queries (point lookups / full scans —
+  faster on the row path).
+- `UNION`, window functions, `ROLLUP`, recursive CTEs.
+- `ALL` / `ANY` / row subqueries and `LATERAL` correlations.
+- Cross-schema joins (different `.duckdb` files).
+- Non-whitelisted functions: `IF`, `CAST` of a non-constant, `GROUP_CONCAT`,
+  JSON/statistical aggregates, and most other string/date functions.
+- `REAL` / `DOUBLE` literals (to avoid floating-point drift).
 - Columns whose collation does not map (see above).
 - Statements with bound parameters, and any query under `EXPLAIN`.
 
@@ -328,19 +340,21 @@ These follow directly from the implementation:
   survive a server crash or restart — on restart there are none to recover (they
   roll back when their connections close). A multi-schema XA commit is
   best-effort because there is no cross-file two-phase commit.
-- **Pushdown is for analytical (aggregate) queries.** Non-aggregate `SELECT`s run
-  through the normal row path by design; they are correct but not column-store
-  accelerated.
+- **Pushdown targets analytical queries.** Aggregate queries, multi-table joins,
+  and `LIMIT`ed queries push down; a single-table non-aggregate `SELECT` with no
+  `LIMIT` (a point lookup) runs through the normal row path by design — correct,
+  just not column-store accelerated.
 - **Decimal division and `AVG` are evaluated in floating point.** DuckDB has no
   exact-decimal division operator: `DECIMAL / DECIMAL` and `AVG(DECIMAL)` are
   computed in double precision and the result is rounded back into MySQL's
   `DECIMAL` result column. Exact `SUM`, `+`, `-`, and `*` over `DECIMAL` stay
   exact. The floating-point path matches MySQL's exact-decimal result for normal
-  data (verified against InnoDB on TPC-H SF1/SF10, including the `AVG` of Q1 and
-  the revenue ratio of Q14), but at a rounding boundary with adversarial values
-  the last digit can differ. If you require bit-exact decimal division/averages,
-  keep those expressions out of pushed queries (or run them as non-aggregate
-  scans, which use the normal MySQL path).
-- **Literal and collation gating.** Floating-point, string, and temporal literals
-  and unmapped collations cause a query to decline rather than risk a divergent
-  result.
+  data — verified against InnoDB across all 22 TPC-H queries at SF1/SF10,
+  including the `AVG` of Q1, the revenue ratio of Q14, and the market-share
+  division of Q8 — but at a rounding boundary with adversarial values the last
+  digit can differ. If you require bit-exact decimal division/averages, keep those
+  expressions out of pushed queries (or run them as non-aggregate scans, which use
+  the normal MySQL path).
+- **Literal and collation gating.** `REAL`/`DOUBLE` literals and unmapped
+  collations cause a query to decline rather than risk a divergent result.
+  (Integer, `DECIMAL`, temporal, and `NULL` literals are bound and push down.)

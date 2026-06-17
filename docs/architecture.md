@@ -64,22 +64,42 @@ whole-query offload.
   handler-level pushed condition (`cond_push`) into a DuckDB `WHERE` applied
   during scans.
 
-### The server patch
+### The server patches
 
-The engine depends on one server patch,
-[`server-patches/0001-engine-query-pushdown.patch`](../server-patches/0001-engine-query-pushdown.patch),
-applied into the MySQL source tree by `scripts/build-server.sh`. It adds:
+The engine depends on three small server patches, applied into the MySQL source
+tree by `scripts/build-server.sh` (idempotent — each is skipped if already
+present). Every patch is generic (keyed on `handlerton::pushdown_select`, not on
+the DuckDB engine specifically) and ABI-safe.
+
+[`0001-engine-query-pushdown.patch`](../server-patches/0001-engine-query-pushdown.patch)
+— the pushdown hook:
 
 - `sql/handler.h` — the `pushdown_select_t` typedef and a
   `handlerton::pushdown_select` member. The member is zero-filled by default, so
-  it is null for every other engine and ABI-safe.
+  it is null for every other engine.
 - `sql/sql_optimizer.cc` — a `single_engine_for_pushdown()` helper that returns
   the common handlerton iff every base table of the query block belongs to the
-  same engine, and a call near the tail of `JOIN::optimize()` (gated on
-  `!is_explain()`) that invokes that engine's `pushdown_select`. If the engine
-  sets `JOIN::override_executor_func`, the optimizer installs a trivial root
-  access path and marks the plan ready; the override runs the query instead.
-  Declining leaves normal iterator execution untouched.
+  same engine (recursing through derived tables), and a call near the tail of
+  `JOIN::optimize()` (gated on `!is_explain()`) that invokes that engine's
+  `pushdown_select`. If the engine sets `JOIN::override_executor_func`, the
+  optimizer installs a trivial root access path and marks the plan ready; the
+  override runs the query instead. Declining leaves normal iterator execution
+  untouched.
+
+[`0002-engine-bulk-load.patch`](../server-patches/0002-engine-bulk-load.patch)
+— a `LOAD DATA` fast path: a `handlerton::load_into` hook in
+`Sql_cmd_load_table::execute_inner` lets the engine ingest a server-side
+`INFILE` directly via DuckDB `COPY` (no per-row handler dispatch), falling back
+to the row path for `LOCAL`, `SET`, triggers, binlog, or non-identity column maps.
+
+[`0003-engine-semijoin-suppression.patch`](../server-patches/0003-engine-semijoin-suppression.patch)
+— in `Sql_cmd_dml::prepare`, an RAII guard clears `OPTIMIZER_SWITCH_SEMIJOIN`
+for statements whose base tables are all one pushdown engine. This keeps `IN` /
+`EXISTS` predicates intact as subquery `Item`s in the `WHERE` (instead of being
+flattened into semijoin nests or hidden behind a materialization temp table), so
+the builder can render them as native DuckDB `IN` / `EXISTS`. It is transparent:
+a query that ultimately declines still executes correctly on the row path —
+turning semijoin off only changes the plan, never the result.
 
 ## Per-schema file model
 
@@ -165,22 +185,36 @@ removes the escaping and injection surface entirely.
 A query is pushed down only when **all** of the following hold:
 
 - It is a simple (non-`UNION`) query block with at least one base table.
-- It is grouped or implicitly grouped (an aggregate query) — the worthwhile
-  offload case.
-- It has no subquery, no window function, and no `ROLLUP`.
-- It has no statement parameters.
+- It is worth offloading: it is grouped or implicitly grouped (an aggregate
+  query), **or** it carries a `LIMIT`, **or** it is a multi-table join. A bare
+  single-table, non-grouped, no-`LIMIT` query (a point lookup or full scan) stays
+  on the row path, where an index seek is faster than staging.
+- It has no window function, no `ROLLUP`, and no statement parameters.
 - Every base table is `ENGINE=DuckDB` and all tables share one schema (one
-  `.duckdb` file). Outer joins and nested-join trees decline; an inner join is
-  rendered as a cross product plus a `WHERE` conjunct.
+  `.duckdb` file). Cross-schema joins decline.
+- **Joins** render across shapes: inner joins (a cross product plus a `WHERE`
+  conjunct), outer joins (a `LEFT JOIN … ON` tree mirroring the server's join
+  nest), and materialized **derived tables** / **CTEs** (rendered as inline
+  `(SELECT …) AS alias`; a CTE referenced more than once is inlined per
+  reference). Recursive CTEs decline.
+- **Subqueries** render natively: scalar subqueries (correlated and
+  uncorrelated), and `IN` / `EXISTS` / `NOT IN` / `NOT EXISTS` predicates. The
+  latter rely on a server patch that suppresses semijoin flattening for engine
+  candidates so the predicate survives as a renderable subquery (see below);
+  `ALL` / `ANY` / row subqueries, `UNION` subqueries, and `LATERAL` dependencies
+  decline.
 - Every select-list item, predicate, `GROUP BY` / `ORDER BY` term, and aggregate
-  renders. Supported aggregates are `COUNT`, `COUNT(*)`, `COUNT(DISTINCT)`,
-  `SUM`, `SUM(DISTINCT)`, `AVG`, `AVG(DISTINCT)`, `MIN`, `MAX`. Supported scalar
-  operators are `+ - * /` and the comparison/`BETWEEN`/`IN`/`IS [NOT] NULL`
-  predicates. Every other function (string, date, `CASE`, `CAST`, `GROUP_CONCAT`,
-  window aggregates, etc.) declines.
-- Every literal maps exactly: integers and `DECIMAL` are bound; `NULL` is bound
-  as a typed NULL. `REAL`/`DOUBLE`, string, and temporal literals decline (ULP
-  drift, charset, and parse ambiguity respectively).
+  renders. Supported aggregates: `COUNT`, `COUNT(*)`, `COUNT(DISTINCT)`, `SUM`,
+  `SUM(DISTINCT)`, `AVG`, `AVG(DISTINCT)`, `MIN`, `MAX`. Supported scalar
+  operators/functions: `+ - * /`, comparisons, `BETWEEN`, `IN`, `IS [NOT] NULL`,
+  `NOT`, collation-aware `LIKE`, searched `CASE`, `EXTRACT(YEAR|QUARTER|MONTH|DAY)`,
+  and `SUBSTRING`. Other functions (e.g. `GROUP_CONCAT`, window aggregates, most
+  string/date functions) decline.
+- Literals map exactly: integers, `DECIMAL`, and any optimizer-folded constant are
+  bound as positional parameters; temporal constants (e.g. `CAST('1998-09-02' AS
+  DATE)`) bind; `NULL` binds as a typed NULL. `REAL` / `DOUBLE` literals decline
+  (ULP drift). `SUBSTRING` position/length are emitted inline so the same
+  expression is textually identical across `SELECT` / `GROUP BY` / `ORDER BY`.
 - Every string column's collation maps (see below); otherwise it declines so a
   case or accent difference cannot change ordering, grouping, or `DISTINCT`.
 - `EXPLAIN` is excluded by the server hook, so `EXPLAIN` always shows a normal
@@ -189,6 +223,11 @@ A query is pushed down only when **all** of the following hold:
 Because the optimizer hook only fires when every base table belongs to one
 engine, non-`ENGINE=DuckDB` queries are never offered to the engine in the first
 place, and a mixed-engine join is never a candidate.
+
+All 22 TPC-H queries are pushed down and return results identical to InnoDB on
+the same data (the subquery shapes above cover the constructs they exercise —
+correlated `EXISTS`, grouped `IN`, `NOT IN`, `NOT EXISTS`, nested `IN`, CTE, and
+`SUBSTRING`).
 
 ### Collation mapping
 

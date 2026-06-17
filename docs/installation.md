@@ -2,7 +2,7 @@
 
 This guide covers two ways to run the engine: the prebuilt Docker image (quickest)
 and building `mysqld` from source with the DuckDB storage engine compiled in
-(acquiring DuckDB, applying the server patch, initializing a data directory, and
+(acquiring DuckDB, applying the server patches, initializing a data directory, and
 starting the server).
 
 The engine is **built into the server** as a MANDATORY storage engine — there is
@@ -106,24 +106,28 @@ examples, see [usage.md](usage.md). To build the image yourself, see
 This means you do not need to set `DUCKDB_ROOT` for a clean checkout that has a
 DuckDB source tree available; the build will produce the static library itself.
 
-## The server patch
+## The server patches
 
-The engine depends on one server patch,
-[`server-patches/0001-engine-query-pushdown.patch`](../server-patches/0001-engine-query-pushdown.patch),
-which adds the `handlerton::pushdown_select` hook to the server. The build script
-applies it idempotently before configuring. To apply it manually:
+The engine depends on three server patches under `server-patches/`:
+
+- `0001-engine-query-pushdown.patch` — the `handlerton::pushdown_select` hook.
+- `0002-engine-bulk-load.patch` — the `LOAD DATA` DuckDB-`COPY` fast path.
+- `0003-engine-semijoin-suppression.patch` — disables semijoin flattening for
+  engine candidates so `IN` / `EXISTS` subqueries push down natively.
+
+The build script applies them idempotently before configuring. To apply manually:
 
 ```sh
 cd vendor/mysql-server
-git apply ../../server-patches/0001-engine-query-pushdown.patch
+for p in ../../server-patches/*.patch; do git apply "$p"; done
 ```
 
-`git apply --check` succeeds only when the patch is not yet applied, so re-running
-the build script never double-applies it.
+`git apply --check` succeeds only when a patch is not yet applied, so re-running
+the build script never double-applies them.
 
 ## Building the server
 
-The supplied script `scripts/build-server.sh` applies the patch, configures the
+The supplied script `scripts/build-server.sh` applies the patches, configures the
 MySQL build, and builds `mysqld` plus the client tools. It expects the engine
 symlink and a DuckDB prefix to be in place (it checks for
 `vendor/duckdb-prefix/lib/libduckdb.a`).
