@@ -26,7 +26,8 @@
 #include "sql/item_cmpfunc.h"
 #include "sql/item_func.h"
 #include "sql/item_sum.h"
-#include "sql/item_timefunc.h"  // Item_extract (EXTRACT)
+#include "sql/item_subselect.h"  // Item_subselect (scalar subqueries)
+#include "sql/item_timefunc.h"   // Item_extract (EXTRACT)
 #include "sql/query_options.h"  // TMP_TABLE_ALL_COLUMNS
 #include "sql/query_result.h"
 #include "sql/sql_class.h"
@@ -301,6 +302,7 @@ bool RenderFieldBare(Item *it, std::string *out, CollationMap *cm_out) {
 }
 
 bool RenderExpr(BuildCtx *ctx, Item *it, std::string *out);
+bool RenderQueryBlock(BuildCtx *ctx, Query_block *qb, std::string *out);
 bool RenderPredicate(BuildCtx *ctx, Item *cond, std::string *out);
 bool RenderCase(BuildCtx *ctx, Item_func *fn, std::string *out);
 
@@ -480,8 +482,27 @@ bool RenderExpr(BuildCtx *ctx, Item *it, std::string *out) {
           return false;  // non-whitelisted scalar function: decline
       }
     }
+    case Item::SUBQUERY_ITEM: {
+      // Scalar subquery: "(SELECT …)". Only an UNCORRELATED single-row scalar
+      // subselect (Item_singlerow_subselect) is rendered here. Correlated/LATERAL
+      // subqueries (inner block references outer columns) are deferred — rendered
+      // standalone their outer refs would bind wrong — and IN/EXISTS/ALL/ANY/row
+      // subselects are not scalar; decline all of those.
+      auto *ss = down_cast<Item_subselect *>(r);
+      if (ss->subquery_type() != Item_subselect::SCALAR_SUBQUERY) return false;
+      Query_expression *qe = ss->query_expr();
+      if (qe == nullptr || qe->query_term() == nullptr || !qe->is_simple())
+        return false;  // UNION/set-op subquery
+      Query_block *inner = qe->first_query_block();
+      if (inner == nullptr || inner->next_query_block() != nullptr) return false;
+      if (qe->m_lateral_deps != 0 || inner->is_dependent()) return false;  // correlated: defer
+      std::string sub;
+      if (!RenderQueryBlock(ctx, inner, &sub)) return false;
+      *out = "(" + sub + ")";
+      return true;
+    }
     default:
-      return false;  // string/date/CASE/IF/CAST/subselect/etc.: decline
+      return false;  // string/date/CAST/IN/EXISTS/correlated-subselect/etc.: decline
   }
 }
 
@@ -1104,11 +1125,13 @@ bool ExecutePushdown(JOIN *join, Query_result *qr) {
   const auto te1 = PdClock::now();  // DuckDB execute done
 
   // Stage the result in a temp table whose visible columns match the query
-  // output 1:1 with the DuckDB result columns (the select list was printed from
-  // these same visible items, in order).
+  // output 1:1 with the DuckDB result columns. Use the SAME source the builder
+  // rendered the SELECT list from — Query_block::visible_fields() — not
+  // join->fields: a HAVING (or SELECT-list) scalar subquery adds an extra
+  // non-hidden item to join->fields that is not in the visible select list, which
+  // would make the staged column count exceed the DuckDB result (TPC-H Q11).
   mem_root_deque<Item *> visible(thd->mem_root);
-  for (Item *it : *join->fields)
-    if (!it->hidden) visible.push_back(it);
+  for (Item *it : join->query_block->visible_fields()) visible.push_back(it);
   if (res.ColumnCount() != visible.size()) {
     RaiseDuckDBError("pushdown column count mismatch");
     return true;
@@ -1232,6 +1255,13 @@ void ReleasePushdownPlan(const THD *thd) {
 
 bool PushdownSelect(THD *thd, JOIN *join) {
   if (join == nullptr || join->query_block == nullptr) return false;
+  // Only take over the OUTERMOST query block. The hook fires once per JOIN —
+  // including each subquery's JOIN — so without this guard we would independently
+  // push an inner subquery block standalone, conflicting with the outer block
+  // that renders that same subquery inline (TPC-H Q11's HAVING subquery).
+  // Subqueries are rendered as nested SQL by the top block's builder, so a
+  // non-top block must decline here.
+  if (join->query_block->outer_query_block() != nullptr) return false;
   // Drop any stale plan this THD's previous optimize may have left (e.g. a query
   // that optimized but never executed). Take() releases it — and its DuckDB
   // connection — via the returned unique_ptr destructor.
