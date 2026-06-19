@@ -358,3 +358,21 @@ These follow directly from the implementation:
 - **Literal and collation gating.** `REAL`/`DOUBLE` literals and unmapped
   collations cause a query to decline rather than risk a divergent result.
   (Integer, `DECIMAL`, temporal, and `NULL` literals are bound and push down.)
+
+## Memory configuration (large scale factors)
+
+The engine runs DuckDB **inside `mysqld`**, so DuckDB's working set sits on top of
+the server's own memory. Under a hard memory limit (a container cgroup, `ulimit`,
+etc.), DuckDB's default memory budget can leave too little headroom and the kernel
+may OOM-kill `mysqld` on a very memory-heavy query. Two environment variables tune
+this (read at first table access per schema):
+
+| Env var | Meaning |
+|---------|---------|
+| `DUCKSDB_MEMORY_LIMIT` | DuckDB memory limit, e.g. `28GB` or `60%`. Set it **below** the server's hard limit so DuckDB spills to disk instead of being OOM-killed. Unset → DuckDB's default. |
+| `DUCKSDB_TEMP_DIR` | Spill directory (defaults to the data directory). |
+
+Rule of thumb under a container limit of *N* GB: set `DUCKSDB_MEMORY_LIMIT` to
+roughly *N* − 12 GB to leave room for `mysqld` and result staging. Spilling keeps
+large queries correct at the cost of speed (e.g. a CTE-heavy query at TPC-H SF100
+on a memory-tight host runs much slower but returns the right result).

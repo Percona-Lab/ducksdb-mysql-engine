@@ -240,6 +240,13 @@ struct BuildCtx {
   // Single-schema guard: all leaf tables must share one DuckDB file.
   const char *db{nullptr};
   size_t dblen{0};
+  // Common table expressions: a CTE referenced more than once is emitted ONCE as
+  // a `WITH <name> AS (<body>)` definition (prepended to the top-level SELECT) and
+  // referenced by name, instead of inlining the body at every reference (which
+  // doubles the work and blows memory at scale — TPC-H Q15 at SF100). cte_names
+  // dedupes by the CTE's name; cte_defs holds the rendered "<name> AS (<body>)".
+  std::vector<std::string> cte_names;
+  std::vector<std::string> cte_defs;
 };
 
 // Append a literal as a bound parameter and emit its placeholder ($N).
@@ -1012,14 +1019,10 @@ bool RenderTableRef(BuildCtx *ctx, Table_ref *tr, std::string *out) {
     if (du->m_lateral_deps != 0 || inner_qb->is_dependent()) return false;
     const char *alias = tr->alias;
     if (alias == nullptr || alias[0] == '\0') return false;
-    std::string inner;
-    if (!RenderQueryBlock(ctx, inner_qb, &inner)) return false;
-    std::string ref = "(" + inner + ") AS " + QuoteIdent(alias);
-    // A derived table may rename its output columns, e.g. `... AS d (a, b)`
-    // (TPC-H Q13: `c_orders (c_custkey, c_count)`). The inner SELECT items keep
-    // their own names, so emit the rename explicitly as `AS alias (c1, c2, …)`
-    // (DuckDB renames positionally) — otherwise the outer block's references to
-    // the renamed columns would not resolve.
+
+    // Optional output-column rename suffix " (c1, c2, …)" — a derived table or
+    // CTE may rename its columns (TPC-H Q13: `c_orders (c_custkey, c_count)`).
+    std::string colsfx;
     const Create_col_name_list *cols = tr->derived_column_names();
     if (cols != nullptr && !cols->empty()) {
       std::string cl;
@@ -1027,9 +1030,47 @@ bool RenderTableRef(BuildCtx *ctx, Table_ref *tr, std::string *out) {
         if (i != 0) cl += ", ";
         cl += QuoteIdent(std::string((*cols)[i].str, (*cols)[i].length));
       }
-      ref += " (" + cl + ")";
+      colsfx = " (" + cl + ")";
     }
-    *out = ref;
+
+    // CTE reference (a `WITH name AS (…)` table): emit the body ONCE as a WITH
+    // definition (deduped by name; prepended to the top-level SELECT by
+    // BuildPushdownSQLBuilder) and reference it by name. This avoids inlining the
+    // body at every reference, which doubles work and OOMs at scale when a CTE is
+    // used more than once (TPC-H Q15's `revenue` at SF100). Recursive CTEs already
+    // declined above (their query_term is a set-op → !is_simple()).
+    if (tr->common_table_expr() != nullptr) {
+      const char *cte = tr->table_name;
+      if (cte == nullptr || cte[0] == '\0') return false;
+      bool seen = false;
+      for (const auto &n : ctx->cte_names)
+        if (n == cte) {
+          seen = true;
+          break;
+        }
+      if (!seen) {
+        std::string body;
+        if (!RenderQueryBlock(ctx, inner_qb, &body)) return false;
+        ctx->cte_names.emplace_back(cte);
+        // `AS MATERIALIZED`: DuckDB INLINES CTEs by default (folding the body
+        // into each reference), which for a multiply-referenced CTE reproduces
+        // the double-evaluation we are trying to avoid. The MATERIALIZED hint
+        // forces DuckDB to evaluate the body once into a temp result — the whole
+        // point of the WITH here (it keeps TPC-H Q15 within memory at SF100).
+        // Semantically identical; only the evaluation strategy changes.
+        ctx->cte_defs.emplace_back(QuoteIdent(cte) + colsfx +
+                                   " AS MATERIALIZED (" + body + ")");
+      }
+      std::string ref = QuoteIdent(cte);
+      if (std::strcmp(alias, cte) != 0) ref += " AS " + QuoteIdent(alias);
+      *out = ref;
+      return true;
+    }
+
+    // Plain inline (non-CTE) derived view: inline the body as "(<select>) AS a".
+    std::string inner;
+    if (!RenderQueryBlock(ctx, inner_qb, &inner)) return false;
+    *out = "(" + inner + ") AS " + QuoteIdent(alias) + colsfx;
     return true;
   }
   TABLE *table = tr->table;
@@ -1390,6 +1431,18 @@ bool BuildPushdownSQLBuilder(const THD *thd, JOIN *join, std::string *db_out,
   std::string sql;
   if (!RenderQueryBlock(&ctx, qb, &sql)) return decline("query-block");
   if (ctx.db == nullptr) return decline("no-schema");
+
+  // Prepend any CTE definitions collected during rendering as a single WITH so a
+  // multiply-referenced CTE materializes once (see RenderTableRef). DuckDB scopes
+  // the WITH to the whole statement, including subqueries that reference it.
+  if (!ctx.cte_names.empty()) {
+    std::string with = "WITH ";
+    for (size_t i = 0; i < ctx.cte_defs.size(); ++i) {
+      if (i != 0) with += ", ";
+      with += ctx.cte_defs[i];
+    }
+    sql = with + " " + sql;
+  }
 
   *db_out = std::string(ctx.db, ctx.dblen);
   *sql_out = std::move(sql);
