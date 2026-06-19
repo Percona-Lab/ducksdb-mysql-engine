@@ -61,7 +61,8 @@ full query guide.
 | [architecture.md](architecture.md) | Components, layering, and the data-flow / sequence diagrams for DDL, writes, reads, whole-query pushdown, and transactions. |
 | [installation.md](installation.md) | Running the prebuilt Docker image (quick start), and building from source: prerequisites, the server patch, DuckDB acquisition, initializing a data directory, and building the runtime image. |
 | [usage.md](usage.md) | End-user guide: creating tables, loading data, query examples, confirming pushdown, supported types and collations, transactions, and current limitations. |
-| [tpch_sf10_mariadb_comparison.md](tpch_sf10_mariadb_comparison.md) | TPC-H SF10 benchmark: the engine vs MariaDB `ENGINE=DuckDB` on the same host (per-query and totals). |
+| [tpch_engine_comparison.md](tpch_engine_comparison.md) | **Full engine bake-off:** InnoDB vs this engine vs MariaDB+DuckDB vs native DuckDB on all 22 TPC-H queries, at SF10 (60M rows) and SF100 (600M rows). |
+| [tpch_sf10_mariadb_comparison.md](tpch_sf10_mariadb_comparison.md) | Earlier SF10 head-to-head: the engine vs MariaDB `ENGINE=DuckDB` (per-query and totals). |
 
 ## Repository layout
 
