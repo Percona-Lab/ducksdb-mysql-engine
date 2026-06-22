@@ -14,7 +14,7 @@ three execution paths over the same data and **checks correctness**:
 | `InnoDB(s)`   | Standard MySQL row store, no acceleration. Also the **correctness oracle**. |
 | `engine(s)`   | A plain `ENGINE=DuckDB` table in the in-tree server (auto-offload). |
 | `native(s)`   | DuckDB CLI on a local file — the analytical upper bound. |
-| `offloaded?`  | `yes` if `Ducksdb_secondary_offload_count` rose during the engine run (query actually ran in DuckDB). |
+| `offloaded?`  | `yes` if `Ducksdb_pushdown_count` rose during the engine run (query actually ran in DuckDB). |
 | `match?`      | `yes` if the engine result set equals InnoDB's (order-independent md5). `SKIP`/`—` if the query couldn't run on MySQL. |
 
 Timing alone is meaningless if the answer is wrong — hence `match?`.
