@@ -33,19 +33,18 @@
 # legs (engine + InnoDB) rather than aborting the whole run — native DuckDB
 # still reports a time so the suite stays informative.
 #
-# ---- PREREQUISITE: the engine server image must exist -----------------------
-# This is GROUNDWORK. The in-tree engine server image does NOT exist yet — it is
-# produced once the in-tree build and the full TPC-H validation are in place
-# (see bench/README.md). Until then this script will refuse to run with a clear
-# message. The native-DuckDB image (ducksdb-duckdb:1.5.3) and data generation
-# already work, so the data path is exercisable today.
+# ---- PREREQUISITE: the engine server image ---------------------------------
+# Needs the in-tree DuckDB-engine server image (default
+# ducksdb/mysql:9.7-duckdb-v0.2.0; see bench/README.md). If it is missing the
+# script preflight-fails with a clear message telling you to pull or build it.
+# The native-DuckDB image (ducksdb-duckdb:1.5.3) handles TPC-H data generation.
 #
 # Nothing is installed on the host: server, DuckDB CLI, and data-gen all run in
 # docker containers. Cleanup is via an EXIT trap.
 #
 # Env knobs (defaults in parens):
 #   SF(1) ITERS(3) CPUS(6) MEM(8g)
-#   IMAGE(ducksdb/mysql-engine:9.7)      <-- in-tree engine server (placeholder)
+#   IMAGE(ducksdb/mysql:9.7-duckdb-v0.2.0)  <-- in-tree engine server image
 #   DUCKDB_VERSION(1.5.3) INNODB_POOL(2G) QTIMEOUT(300)
 #   ONLY("")  -> run only these query numbers, e.g. ONLY="1 6 14"
 # =============================================================================
@@ -57,7 +56,7 @@ SF=${SF:-1}
 ITERS=${ITERS:-3}
 CPUS=${CPUS:-6}
 MEM=${MEM:-8g}
-IMAGE=${IMAGE:-ducksdb/mysql-engine:9.7}
+IMAGE=${IMAGE:-ducksdb/mysql:9.7-duckdb-v0.2.0}
 DUCKDB_VERSION=${DUCKDB_VERSION:-1.5.3}
 DUCKDB_IMAGE="ducksdb-duckdb:$DUCKDB_VERSION"
 INNODB_POOL=${INNODB_POOL:-2G}
@@ -87,16 +86,12 @@ elapsed(){ awk -v a="$1" -v b="$2" 'BEGIN{printf "%.3f", b-a}'; }
 # -----------------------------------------------------------------------------
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   cat >&2 <<EOF
-[t22] ERROR: in-tree engine server image '$IMAGE' not found.
+[t22] ERROR: in-tree engine server image '$IMAGE' not found locally.
 
-  This harness is GROUNDWORK and needs the in-tree DuckDB-engine server image,
-  which is produced once the in-tree build and TPC-H validation are in place.
-
-  Build that image first (see bench/README.md), or point this script at it:
+  Pull it:
+      docker pull $IMAGE
+  or point the harness at another build:
       IMAGE=<your-engine-image> bench/run-tpch22.sh
-
-  To smoke-test only the data-generation + native-DuckDB path before the
-  engine exists, set a throwaway IMAGE and expect the MySQL legs to no-op.
 EOF
   exit 2
 fi

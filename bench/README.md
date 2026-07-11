@@ -29,20 +29,18 @@ Timing alone is meaningless if the answer is wrong — hence `match?`.
    docker build --build-arg DUCKDB_VERSION=1.5.3 \
      -t ducksdb-duckdb:1.5.3 -f Dockerfile.duckdb .
    ```
-3. **The in-tree engine server image** — **this does not exist yet.** It is
-   produced once the in-tree build (`ENGINE=DuckDB` CRUD) and the full 22-query
-   TPC-H validation are in place. Until that image is built, the harness
-   **preflight-fails with a clear message** — this is expected. It is groundwork.
-
-   Once built, point the harness at it:
+3. **The in-tree engine server image.** Published as
+   `ducksdb/mysql:9.7-duckdb-v0.2.0` (mirror:
+   `evgeniypatlan/test-images:mysql-9.7-duckdb-v0.2.0`). The harness uses it by
+   default; point it elsewhere with `IMAGE=`:
    ```bash
-   IMAGE=ducksdb/mysql-engine:9.7 bench/run-tpch22.sh
+   IMAGE=ducksdb/mysql:9.7-duckdb-v0.2.0 bench/run-tpch22.sh
    ```
 
 ### Running
 
 ```bash
-# defaults: SF=1, ITERS=3, IMAGE=ducksdb/mysql-engine:9.7
+# defaults: SF=1, ITERS=3, IMAGE=ducksdb/mysql:9.7-duckdb-v0.2.0
 bench/run-tpch22.sh
 
 # bigger scale factor, more iterations
@@ -61,7 +59,7 @@ IMAGE=my-registry/ducksdb-engine:dev bench/run-tpch22.sh
 |-----|---------|---------|
 | `SF` | `1` | TPC-H scale factor (`CALL dbgen(sf=SF)`). |
 | `ITERS` | `3` | Timed iterations per query (min reported; 1 warmup excluded). |
-| `IMAGE` | `ducksdb/mysql-engine:9.7` | In-tree engine server image (**placeholder until the engine image is built**). |
+| `IMAGE` | `ducksdb/mysql:9.7-duckdb-v0.2.0` | In-tree engine server image. |
 | `DUCKDB_VERSION` | `1.5.3` | Native DuckDB CLI version (image `ducksdb-duckdb:$VER`). |
 | `CPUS` / `MEM` | `6` / `8g` | Per-container resource pins. |
 | `INNODB_POOL` | `2G` | InnoDB buffer pool size. |
@@ -122,9 +120,12 @@ which MySQL 8+ supports), and **Q22** (correlated `avg` subquery — portable).
 These are flagged as the most likely to want a second look, not guaranteed
 failures.
 
-## Status / groundwork note
+## SF100 (~600M rows)
 
-This harness is **correct and complete but not yet runnable end-to-end** because
-the in-tree engine server image is built later. The data-generation and
-native-DuckDB paths are exercisable today. When the engine image lands, the only
-change needed is a real `IMAGE=` value.
+At SF100 the InnoDB oracle is infeasible (a copy of the data alone is ~100 GB),
+so `bench/sf100-correctness.sh` swaps the oracle: it checks `ENGINE=DuckDB`
+against **native DuckDB** on the same generated data, loads via the server-side
+`COPY` fast-path, and caps the embedded DuckDB's `memory_limit` below the
+container so a heavy query spills to disk instead of OOM-killing `mysqld`. Run
+`bench/run-tpch22.sh SF=100` first to generate/export the data, then
+`bench/sf100-correctness.sh`.
