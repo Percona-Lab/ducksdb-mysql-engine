@@ -127,7 +127,8 @@ in every configuration; only its time reflects the cap.
   `IMAGE=ducksdb/mysql:9.7-duckdb-v0.2.0 SF=10 QTIMEOUT=180 bench/run-tpch22.sh`
 - SF100 (this engine vs native, sequential phases, correctness + timings):
   `IMAGE=ducksdb/mysql:9.7-duckdb-v0.2.0 SF=100 MEM=44g DUCK_MEM=28GB bench/sf100-correctness.sh`
-- MariaDB leg: `mariadb-bench/run-mariadb-tpch22.sh` (`NO_CLEAN=1 SF=100` for SF100).
+- MariaDB leg: `bench/mariadb/run-mariadb-tpch22.sh` (`NO_CLEAN=1 SF=100` for SF100);
+  see `bench/mariadb/README.md`.
 
 CSVs are quote-stripped once so all engines load identical data; at SF100 the
 engines are run one at a time to avoid co-resident OOM.

@@ -5,7 +5,7 @@ automatic pushdown. Times are **wall-clock, warm (min of 3 iterations,
 1 warmup excluded)**, 20 threads.
 
 - Engine: image `ducksdb/mysql:9.7-duckdb-p15` (RelWithDebInfo), via `bench/run-tpch22.sh`.
-- MariaDB: locally-built `mariadbd` + `ha_duckdb.so`, via `mariadb-bench/run-mariadb-tpch22.sh`.
+- MariaDB: locally-built `mariadbd` + `ha_duckdb.so`, via `bench/mariadb/run-mariadb-tpch22.sh`.
 
 | Q | MariaDB (s) | Engine (s) | ratio (eng/mdb) |
 |---|---|---|---|

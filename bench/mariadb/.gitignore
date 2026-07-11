@@ -1,0 +1,6 @@
+# The MariaDB source + build trees are intentionally NOT committed (gigabytes of
+# third-party GPL source and build artifacts). If you clone/build them under
+# here instead of at a sibling path, keep them out of git.
+mariadb-server/
+DuckdbBuildOf_*/
+*.log
