@@ -87,11 +87,21 @@ RQ -e "CHANGE REPLICATION SOURCE TO
          SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1;" \
   || die "CHANGE REPLICATION SOURCE failed"
 RQ -e "START REPLICA;" || die "START REPLICA failed"
-sleep 5
 
-repl_status(){ RQ -e "SHOW REPLICA STATUS\G" 2>/dev/null; }
-io=$(repl_status | awk -F': *' '/Replica_IO_Running/{print $2; exit}')
-sql=$(repl_status | awk -F': *' '/Replica_SQL_Running:/{print $2; exit}')
+# Use -E (vertical) rather than a trailing \G: this client rejects \G passed via
+# -e ("Unknown command '\G'"), which silently emptied the status and made the
+# thread check a false negative.
+repl_status(){ RQ -E -e "SHOW REPLICA STATUS" 2>/dev/null; }
+# Poll: the IO/SQL threads take a moment to report Yes after START REPLICA
+# (GTID auto-position + caching_sha2 handshake). A single check right after was a
+# false negative even though replication was in fact running.
+io=No; sql=No
+for _ in $(seq 1 30); do
+  io=$(repl_status | awk -F': *' '/Replica_IO_Running/{print $2; exit}')
+  sql=$(repl_status | awk -F': *' '/Replica_SQL_Running:/{print $2; exit}')
+  [ "$io" = "Yes" ] && [ "$sql" = "Yes" ] && break
+  sleep 2
+done
 echo "  Replica_IO_Running=$io  Replica_SQL_Running=$sql"
 if [ "$io" = "Yes" ] && [ "$sql" = "Yes" ]; then ok "replication threads running"
 else
@@ -126,7 +136,10 @@ echo; echo "[7/7] apply throughput: $ROWS rows inserted on the master"
 MQ rpl -e "CREATE TABLE IF NOT EXISTS t2 (id BIGINT NOT NULL, v INT, PRIMARY KEY (id)) ENGINE=InnoDB;"
 RQ rpl -e "CREATE TABLE IF NOT EXISTS t2 (id BIGINT NOT NULL, v INT, PRIMARY KEY (id)) ENGINE=DuckDB;" >/dev/null 2>&1
 t0=$(date +%s)
-MQ rpl -e "INSERT INTO t2 (id,v) WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n<$ROWS) SELECT n, n%1000 FROM s;" \
+# cte_max_recursion_depth defaults to 1000, so the row generator must raise it
+# above ROWS or the recursive CTE aborts (ERROR 3636).
+MQ rpl -e "SET SESSION cte_max_recursion_depth=$((ROWS + 10));
+  INSERT INTO t2 (id,v) WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n<$ROWS) SELECT n, n%1000 FROM s;" \
   2>/tmp/rpl-bulk.err || { echo "  bulk insert on master failed:"; sed 's/^/    /' /tmp/rpl-bulk.err; }
 t1=$(date +%s)
 echo "  master insert of $ROWS rows: $((t1-t0))s"
