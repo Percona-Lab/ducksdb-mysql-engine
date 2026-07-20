@@ -1,0 +1,26 @@
+diff --git a/sql/sql_optimizer.cc b/sql/sql_optimizer.cc
+index 0c919e005..1920a1972 100644
+--- a/sql/sql_optimizer.cc
++++ b/sql/sql_optimizer.cc
+@@ -443,6 +488,21 @@ bool JOIN::optimize(bool finalize_access_paths) {
+                                     OPTION_NO_SUBQUERY_DURING_OPTIMIZATION);
+   }
+ 
++  // Engine pushdown: don't evaluate uncorrelated subqueries during optimization
++  // when this block is a whole-query pushdown candidate. Evaluating one here
++  // executes it, materializing any CTE/derived table it reads through the row
++  // path, which the pushdown_select hook below then renders into engine SQL
++  // anyway (TPC-H Q15: 23 s of duplicate work vs 29 ms of engine execution).
++  // Same rationale as open_tables_for_query() applies for secondary engines.
++  // The subquery is evaluated at execution time instead; declining pushdown
++  // still yields correct results on the row path.
++  if (!thd->lex->is_explain() && query_block->leaf_tables != nullptr) {
++    const handlerton *pd_hton = single_engine_for_pushdown(query_block);
++    if (pd_hton != nullptr && pd_hton->pushdown_select != nullptr) {
++      query_block->add_active_options(OPTION_NO_SUBQUERY_DURING_OPTIMIZATION);
++    }
++  }
++
+   has_lateral = false;
+ 
+   /* dump_TABLE_LIST_graph(query_block, query_block->leaf_tables); */
