@@ -1,0 +1,132 @@
+CREATE DATABASE cte;
+USE cte;
+CREATE TABLE supp (id INT PRIMARY KEY, name CHAR(10)) ENGINE=DuckDB;
+INSERT INTO supp VALUES (1,'alpha'),(2,'beta'),(3,'gamma');
+CREATE TABLE li (supp_id INT, amt DECIMAL(12,2), d DATE) ENGINE=DuckDB;
+INSERT INTO li VALUES
+(1,'100.00','1996-01-10'),(1,'50.00','1996-02-20'),
+(2,'200.00','1996-03-01'),
+(3,'999.00','1996-05-01');
+#### CTE with an aggregate, referenced twice (TPC-H Q15 shape) ####
+# in-window totals: supp 1 = 150.00, supp 2 = 200.00; supp 3 excluded
+SELECT VARIABLE_VALUE INTO @p0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+WITH rev AS (
+SELECT supp_id, SUM(amt) AS total FROM li
+WHERE d >= DATE '1996-01-01' AND d < DATE '1996-04-01'
+   GROUP BY supp_id)
+SELECT s.id, s.name, r.total
+FROM supp s, rev r
+WHERE s.id = r.supp_id AND r.total = (SELECT MAX(total) FROM rev)
+ORDER BY s.id;
+id	name	total
+2	beta	200.00
+# pushed down (+1):
+SELECT VARIABLE_VALUE-@p0 AS pushed FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+pushed
+1
+#### handler-read guard ####
+CREATE TABLE big (supp_id INT, amt DECIMAL(12,2), d DATE) ENGINE=DuckDB;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO big (supp_id, amt, d)
+WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n < 3000)
+SELECT (n%3)+1, 10.00+n, DATE '1996-01-01' + INTERVAL (n%60) DAY FROM s;
+SELECT COUNT(*) AS big_rows FROM big;
+big_rows
+3000
+SELECT VARIABLE_VALUE INTO @h0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Handler_read_key';
+WITH rev2 AS (
+SELECT supp_id, SUM(amt) AS total FROM big
+WHERE d >= DATE '1996-01-01' AND d < DATE '1996-04-01'
+   GROUP BY supp_id)
+SELECT s.id, r.total FROM supp s, rev2 r
+WHERE s.id = r.supp_id AND r.total = (SELECT MAX(total) FROM rev2)
+ORDER BY s.id;
+id	total
+1	1511500.00
+# 1 = no server-side materialization; 0 means patch 0004 regressed:
+SELECT (VARIABLE_VALUE-@h0) < 100 AS no_server_side_materialization
+FROM performance_schema.global_status WHERE VARIABLE_NAME='Handler_read_key';
+no_server_side_materialization
+1
+DROP TABLE big;
+#### same shape as two separate derived tables ####
+SELECT s.id, s.name, r.total
+FROM supp s,
+(SELECT supp_id, SUM(amt) AS total FROM li
+WHERE d >= DATE '1996-01-01' AND d < DATE '1996-04-01'
+         GROUP BY supp_id) r
+WHERE s.id = r.supp_id
+AND r.total = (SELECT MAX(total) FROM
+(SELECT supp_id, SUM(amt) AS total FROM li
+WHERE d >= DATE '1996-01-01' AND d < DATE '1996-04-01'
+                     GROUP BY supp_id) r2)
+ORDER BY s.id;
+id	name	total
+2	beta	200.00
+#### CTE referenced once ####
+WITH rev AS (SELECT supp_id, SUM(amt) AS total FROM li GROUP BY supp_id)
+SELECT supp_id, total FROM rev ORDER BY supp_id;
+supp_id	total
+1	150.00
+2	200.00
+3	999.00
+#### uncorrelated scalar subquery in WHERE ####
+SELECT id, name FROM supp
+WHERE id = (SELECT MIN(supp_id) FROM li WHERE amt > '99.00')
+ORDER BY id;
+id	name
+1	alpha
+#### correlated subquery ####
+SELECT s.id, s.name,
+(SELECT SUM(amt) FROM li WHERE li.supp_id = s.id) AS tot
+FROM supp s ORDER BY s.id;
+id	name	tot
+1	alpha	150.00
+2	beta	200.00
+3	gamma	999.00
+#### IN / EXISTS ####
+SELECT id, name FROM supp
+WHERE id IN (SELECT supp_id FROM li WHERE d < DATE '1996-04-01') ORDER BY id;
+id	name
+1	alpha
+2	beta
+SELECT id, name FROM supp s
+WHERE EXISTS (SELECT 1 FROM li WHERE li.supp_id = s.id AND li.amt > '500.00')
+ORDER BY id;
+id	name
+3	gamma
+#### empty result: CTE matches nothing, referenced twice ####
+WITH rev AS (
+SELECT supp_id, SUM(amt) AS total FROM li
+WHERE d >= DATE '2100-01-01'
+   GROUP BY supp_id)
+SELECT s.id, r.total FROM supp s, rev r
+WHERE s.id = r.supp_id AND r.total = (SELECT MAX(total) FROM rev)
+ORDER BY s.id;
+id	total
+#### prepared statement executed twice ####
+PREPARE st FROM '
+  WITH rev AS (SELECT supp_id, SUM(amt) AS total FROM li
+                WHERE d >= DATE ''1996-01-01'' AND d < DATE ''1996-04-01''
+                GROUP BY supp_id)
+  SELECT s.id, r.total FROM supp s, rev r
+   WHERE s.id = r.supp_id AND r.total = (SELECT MAX(total) FROM rev)
+   ORDER BY s.id';
+EXECUTE st;
+id	total
+2	200.00
+EXECUTE st;
+id	total
+2	200.00
+DEALLOCATE PREPARE st;
+#### EXPLAIN on the doubly-referenced shape ####
+EXPLAIN WITH rev AS (SELECT supp_id, SUM(amt) AS total FROM li GROUP BY supp_id)
+SELECT s.id FROM supp s, rev r
+WHERE s.id = r.supp_id AND r.total = (SELECT MAX(total) FROM rev);
+# EXPLAIN did not error
+DROP TABLE li;
+DROP TABLE supp;
+DROP DATABASE cte;

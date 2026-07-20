@@ -1,0 +1,126 @@
+# Regression test for server patch 0004: a CTE/derived table referenced more
+# than once must not be materialized by the server through the row path when the
+# whole query is pushed down. Pins both the results and the handler-read count.
+CREATE DATABASE cte;
+USE cte;
+
+CREATE TABLE supp (id INT PRIMARY KEY, name CHAR(10)) ENGINE=DuckDB;
+INSERT INTO supp VALUES (1,'alpha'),(2,'beta'),(3,'gamma');
+
+CREATE TABLE li (supp_id INT, amt DECIMAL(12,2), d DATE) ENGINE=DuckDB;
+# supp 3's row is dated outside the query window on purpose.
+INSERT INTO li VALUES
+ (1,'100.00','1996-01-10'),(1,'50.00','1996-02-20'),
+ (2,'200.00','1996-03-01'),
+ (3,'999.00','1996-05-01');
+
+--echo #### CTE with an aggregate, referenced twice (TPC-H Q15 shape) ####
+--echo # in-window totals: supp 1 = 150.00, supp 2 = 200.00; supp 3 excluded
+SELECT VARIABLE_VALUE INTO @p0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+WITH rev AS (
+  SELECT supp_id, SUM(amt) AS total FROM li
+   WHERE d >= DATE '1996-01-01' AND d < DATE '1996-04-01'
+   GROUP BY supp_id)
+SELECT s.id, s.name, r.total
+  FROM supp s, rev r
+ WHERE s.id = r.supp_id AND r.total = (SELECT MAX(total) FROM rev)
+ ORDER BY s.id;
+--echo # pushed down (+1):
+SELECT VARIABLE_VALUE-@p0 AS pushed FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Ducksdb_pushdown_count';
+
+--echo #### handler-read guard ####
+# Results alone cannot detect a regression: an unpatched server returns the same
+# answers, only slower. Handler_read_key counts rows the server pulled through
+# the row path. On this shape with 3000 base rows: patched ~0, unpatched ~3000.
+# A once-referenced CTE reads 3000 in both, so the signal is specific to the
+# doubly-referenced shape. Reading global_status itself costs a few reads, hence
+# a threshold rather than an exact 0.
+CREATE TABLE big (supp_id INT, amt DECIMAL(12,2), d DATE) ENGINE=DuckDB;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO big (supp_id, amt, d)
+WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n < 3000)
+SELECT (n%3)+1, 10.00+n, DATE '1996-01-01' + INTERVAL (n%60) DAY FROM s;
+SELECT COUNT(*) AS big_rows FROM big;
+
+SELECT VARIABLE_VALUE INTO @h0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Handler_read_key';
+WITH rev2 AS (
+  SELECT supp_id, SUM(amt) AS total FROM big
+   WHERE d >= DATE '1996-01-01' AND d < DATE '1996-04-01'
+   GROUP BY supp_id)
+SELECT s.id, r.total FROM supp s, rev2 r
+ WHERE s.id = r.supp_id AND r.total = (SELECT MAX(total) FROM rev2)
+ ORDER BY s.id;
+--echo # 1 = no server-side materialization; 0 means patch 0004 regressed:
+SELECT (VARIABLE_VALUE-@h0) < 100 AS no_server_side_materialization
+  FROM performance_schema.global_status WHERE VARIABLE_NAME='Handler_read_key';
+DROP TABLE big;
+
+--echo #### same shape as two separate derived tables ####
+SELECT s.id, s.name, r.total
+  FROM supp s,
+       (SELECT supp_id, SUM(amt) AS total FROM li
+         WHERE d >= DATE '1996-01-01' AND d < DATE '1996-04-01'
+         GROUP BY supp_id) r
+ WHERE s.id = r.supp_id
+   AND r.total = (SELECT MAX(total) FROM
+                   (SELECT supp_id, SUM(amt) AS total FROM li
+                     WHERE d >= DATE '1996-01-01' AND d < DATE '1996-04-01'
+                     GROUP BY supp_id) r2)
+ ORDER BY s.id;
+
+--echo #### CTE referenced once ####
+WITH rev AS (SELECT supp_id, SUM(amt) AS total FROM li GROUP BY supp_id)
+SELECT supp_id, total FROM rev ORDER BY supp_id;
+
+--echo #### uncorrelated scalar subquery in WHERE ####
+SELECT id, name FROM supp
+ WHERE id = (SELECT MIN(supp_id) FROM li WHERE amt > '99.00')
+ ORDER BY id;
+
+--echo #### correlated subquery ####
+SELECT s.id, s.name,
+       (SELECT SUM(amt) FROM li WHERE li.supp_id = s.id) AS tot
+  FROM supp s ORDER BY s.id;
+
+--echo #### IN / EXISTS ####
+SELECT id, name FROM supp
+ WHERE id IN (SELECT supp_id FROM li WHERE d < DATE '1996-04-01') ORDER BY id;
+SELECT id, name FROM supp s
+ WHERE EXISTS (SELECT 1 FROM li WHERE li.supp_id = s.id AND li.amt > '500.00')
+ ORDER BY id;
+
+--echo #### empty result: CTE matches nothing, referenced twice ####
+WITH rev AS (
+  SELECT supp_id, SUM(amt) AS total FROM li
+   WHERE d >= DATE '2100-01-01'
+   GROUP BY supp_id)
+SELECT s.id, r.total FROM supp s, rev r
+ WHERE s.id = r.supp_id AND r.total = (SELECT MAX(total) FROM rev)
+ ORDER BY s.id;
+
+--echo #### prepared statement executed twice ####
+PREPARE st FROM '
+  WITH rev AS (SELECT supp_id, SUM(amt) AS total FROM li
+                WHERE d >= DATE ''1996-01-01'' AND d < DATE ''1996-04-01''
+                GROUP BY supp_id)
+  SELECT s.id, r.total FROM supp s, rev r
+   WHERE s.id = r.supp_id AND r.total = (SELECT MAX(total) FROM rev)
+   ORDER BY s.id';
+EXECUTE st;
+EXECUTE st;
+DEALLOCATE PREPARE st;
+
+--echo #### EXPLAIN on the doubly-referenced shape ####
+--disable_result_log
+EXPLAIN WITH rev AS (SELECT supp_id, SUM(amt) AS total FROM li GROUP BY supp_id)
+SELECT s.id FROM supp s, rev r
+ WHERE s.id = r.supp_id AND r.total = (SELECT MAX(total) FROM rev);
+--enable_result_log
+--echo # EXPLAIN did not error
+
+DROP TABLE li;
+DROP TABLE supp;
+DROP DATABASE cte;
