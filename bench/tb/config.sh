@@ -46,7 +46,7 @@ NATIVE_MODE=${NATIVE_MODE:-attach}
 # a local-only build tag that does not exist in any registry - on a fresh node
 # it cannot be pulled. ensure_images() (lib.sh) pulls this one and builds the
 # other two from inline Dockerfiles, so a brand-new node needs nothing staged.
-ENGINE_IMAGE=${ENGINE_IMAGE:-evgeniypatlan/test-images:mysql-9.7-duckdb-v0.2.0}
+ENGINE_IMAGE=${ENGINE_IMAGE:-evgeniypatlan/test-images:mysql-9.7-duckdb-v0.2.1}
 DUCKDB_IMAGE=${DUCKDB_IMAGE:-ducksdb-duckdb:1.5.3}   # built locally if absent
 DUCKDB_CLI_VERSION=${DUCKDB_CLI_VERSION:-1.5.3}
 GEN_IMAGE=${GEN_IMAGE:-ducksdb-tpchgen:latest}       # built locally if absent
