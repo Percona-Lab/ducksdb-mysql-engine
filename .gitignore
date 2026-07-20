@@ -8,3 +8,6 @@ bench/results/
 bench/data/
 dist/
 bench/data-sf*/
+
+# regenerable harness archive (make-archive.sh)
+bench/tpch-tb-harness.tar.gz
