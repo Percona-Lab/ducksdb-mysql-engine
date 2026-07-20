@@ -52,10 +52,34 @@ NAT_GB=$DUCK_GB
 RAW_I=$(est_int 1.0); DUCK_I=$(est_int 0.30); INNO_I=$(est_int 1.80); TMP_I=$(est_int 0.50)
 NAT_I=$DUCK_I
 
+# Match the ACTUAL run's footprint, exactly as run-all.sh and plan.sh do:
+#  - STREAM=auto materialises only one chunk at a time when the CSV set would
+#    exceed 25% of free space, so the generated-CSV cost is ~CHUNK_GB, not full SF.
+#  - NATIVE_MODE=attach reuses the engine's own file, so the native leg is 0 GB.
+# Without this, preflight summed the naive footprint (full CSV + a native copy)
+# and failed runs that genuinely fit.
+root_free_gb=$(( $(free_bytes "$TB_ROOT") /1024/1024/1024 ))
+_stream=${STREAM:-auto}
+if [ "$_stream" = auto ]; then
+  _stream=$(awk -v sf="$SF" -v free="$root_free_gb" 'BEGIN{ print (free>0 && sf > free/4) ? 1 : 0 }')
+fi
+CHUNK_GB=${CHUNK_GB:-20}
+
+if [ "$_stream" = 1 ]; then
+  RAW_SHOW="$((CHUNK_GB*2)) (streamed; peak one chunk)"; RAW_I=$((CHUNK_GB*2))
+else
+  RAW_SHOW="$RAW_GB (full CSV)"
+fi
 need_gb=$RAW_I
-printf '  generated CSV            ~%6s GB\n' "$RAW_GB"
+printf '  generated CSV            ~%6s GB\n' "$RAW_SHOW"
 case " $LEGS " in *" duckdb "*) printf '  ENGINE=DuckDB datadir    ~%6s GB\n' "$DUCK_GB"; need_gb=$((need_gb+DUCK_I));; esac
-case " $LEGS " in *" native "*) printf '  native DuckDB file       ~%6s GB\n' "$NAT_GB";  need_gb=$((need_gb+NAT_I));; esac
+case " $LEGS " in *" native "*)
+  if [ "${NATIVE_MODE:-attach}" = attach ]; then
+    printf '  native DuckDB (attach)   ~%6s GB\n' "0"
+  else
+    printf '  native DuckDB file       ~%6s GB\n' "$NAT_GB"; need_gb=$((need_gb+NAT_I))
+  fi;;
+esac
 case " $LEGS " in *" innodb "*) printf '  InnoDB datadir           ~%6s GB\n' "$INNO_GB"; need_gb=$((need_gb+INNO_I));; esac
 printf '  DuckDB spill / temp      ~%6s GB\n' "$TMP_GB"; need_gb=$((need_gb+TMP_I))
 printf '  ----------------------------------\n'
