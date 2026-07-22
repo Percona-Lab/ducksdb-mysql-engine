@@ -46,7 +46,7 @@ NATIVE_MODE=${NATIVE_MODE:-attach}
 # a local-only build tag that does not exist in any registry - on a fresh node
 # it cannot be pulled. ensure_images() (lib.sh) pulls this one and builds the
 # other two from inline Dockerfiles, so a brand-new node needs nothing staged.
-ENGINE_IMAGE=${ENGINE_IMAGE:-evgeniypatlan/test-images:mysql-9.7-duckdb-v0.2.1}
+ENGINE_IMAGE=${ENGINE_IMAGE:-evgeniypatlan/test-images:mysql-9.7-duckdb-v0.2.2}
 DUCKDB_IMAGE=${DUCKDB_IMAGE:-ducksdb-duckdb:1.5.3}   # built locally if absent
 DUCKDB_CLI_VERSION=${DUCKDB_CLI_VERSION:-1.5.3}
 GEN_IMAGE=${GEN_IMAGE:-ducksdb-tpchgen:latest}       # built locally if absent
@@ -78,6 +78,16 @@ SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-600}
 QUERY_SEQ=${QUERY_SEQ:-"1 2 3 4 5 6 7 8 9 10 11 12 13 14 16 17 18 19 20 21 22 15"}
 
 export TABLES="region nation supplier customer part partsupp orders lineitem"
+
+# String-column collation for the InnoDB + ENGINE=DuckDB tables. Empty = server
+# default (case-insensitive, e.g. utf8mb4_0900_ai_ci). Native DuckDB compares
+# byte-wise, so a _ci collation makes the engine emit COLLATE NOCASE and run
+# string GROUP BY / ORDER BY / DISTINCT slower than native (measured ~1.6x on
+# TPC-H Q1). Set TABLE_COLLATE=utf8mb4_bin for a byte-wise, apples-to-apples
+# comparison against native (and to remove that tax); it applies to InnoDB and
+# the engine equally, so the comparison stays fair.
+TABLE_COLLATE=${TABLE_COLLATE:-}
+table_opts(){ printf 'ENGINE=%s%s' "$1" "${TABLE_COLLATE:+ DEFAULT CHARSET=utf8mb4 COLLATE=$TABLE_COLLATE}"; }
 
 # ---- derived ----------------------------------------------------------------
 mkdir -p "$RESULTS_DIR" "$STATE_DIR" 2>/dev/null || true

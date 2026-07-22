@@ -66,7 +66,7 @@ for t in $TABLES; do
   fi
 
   Q "$ENGINE" "$DB" -e "DROP TABLE IF EXISTS $t;" 2>/dev/null
-  Q "$ENGINE" "$DB" -e "CREATE TABLE $t ($(ddl_cols "$t" "$WITH_PK")) ENGINE=$SQL_ENGINE;" \
+  Q "$ENGINE" "$DB" -e "CREATE TABLE $t ($(ddl_cols "$t" "$WITH_PK")) $(table_opts "$SQL_ENGINE");" \
     2>>"$RESULTS_DIR/load-$ENGINE.err" || { log "CREATE $t FAILED"; failed=$((failed+1)); continue; }
 
   log "loading $t ($(hr "$(stat -c%s "$host_f")")) ..."

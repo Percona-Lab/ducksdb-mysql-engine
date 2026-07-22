@@ -62,7 +62,7 @@ for t in $TABLES; do
   # Create the table once, on the first chunk of a fresh table.
   if [ ! -f "$statef" ]; then
     Q "$ENGINE" "$DB" -e "DROP TABLE IF EXISTS $t;" 2>/dev/null
-    Q "$ENGINE" "$DB" -e "CREATE TABLE $t ($(ddl_cols "$t" "$WITH_PK")) ENGINE=$SQL_ENGINE;" \
+    Q "$ENGINE" "$DB" -e "CREATE TABLE $t ($(ddl_cols "$t" "$WITH_PK")) $(table_opts "$SQL_ENGINE");" \
       2>>"$RESULTS_DIR/streamload-$ENGINE.err" || die "CREATE $t failed"
     : > "$statef"
   fi
