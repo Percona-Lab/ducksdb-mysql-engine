@@ -200,8 +200,8 @@ bool ha_duckdb::load_data_fast(const char *file_path, const sql_exchange *ex,
     // Only the cleanly, provably-equivalent CSV profile pushes to COPY; anything
     // else falls back to the row path (handled stays false). We require: a
     // single-byte field terminator, a '\n' (or default) line terminator, no
-    // LINES STARTING BY, no enclosure (DuckDB would treat '"' specially), the
-    // default '\' (or no) escape, and plain INSERT semantics (no REPLACE/IGNORE).
+    // LINES STARTING BY, a single-byte (or absent) enclosure, the default '\'
+    // (or no) escape, and plain INSERT semantics (no REPLACE/IGNORE).
     const String *fterm = ex->field.field_term;
     const String *encl = ex->field.enclosed;
     const String *esc = ex->field.escaped;
@@ -210,15 +210,33 @@ bool ha_duckdb::load_data_fast(const char *file_path, const sql_exchange *ex,
     if (fterm == nullptr || fterm->length() != 1) return false;
     if (!IsEmpty(lstart)) return false;                       // LINES STARTING BY
     if (!(IsEmpty(lterm) || IsByte(lterm, '\n'))) return false;
-    if (!IsEmpty(encl)) return false;                         // ENCLOSED BY
     if (!(IsEmpty(esc) || IsByte(esc, '\\'))) return false;   // non-default escape
     if (dup == DUP_REPLACE || ignore) return false;          // dup handling differs
+
+    // ENCLOSED BY 'x' maps to DuckDB COPY QUOTE 'x' with ESCAPE 'x' — i.e. an
+    // embedded quote inside a quoted field is written doubled ("") per RFC-4180,
+    // which is what MySQL's OPTIONALLY ENCLOSED BY produces and what tpchgen and
+    // standard CSV writers emit, so the fast path and the row path parse the file
+    // identically. ESCAPE is the quote char rather than '\' because '\' collides
+    // with the NULL '\N' sentinel (DuckDB rejects the combination). A file that
+    // instead backslash-escapes quotes (non-RFC-4180) is not handled here: COPY
+    // errors loudly rather than mis-parsing. Absent enclosure keeps the prior
+    // QUOTE ''/ESCAPE '' (no quoting) behaviour unchanged.
+    std::string quote, escape;
+    if (!IsEmpty(encl)) {
+        if (encl->length() != 1) return false;               // multi-byte enclosure
+        quote.assign(encl->ptr(), 1);
+        escape = quote;                                       // RFC-4180 doubled quote
+    }
 
     std::string sql =
         "COPY " + ducksdb_mysql::QuoteIdent(table_name_) + " FROM " +
         SqlLiteral(file_path, std::strlen(file_path)) +
         " (FORMAT csv, HEADER false, AUTO_DETECT false, DELIMITER " +
-        SqlLiteral(fterm->ptr(), 1) + ", QUOTE '', ESCAPE '', NULL '\\N'";
+        SqlLiteral(fterm->ptr(), 1) +
+        ", QUOTE " + SqlLiteral(quote.data(), quote.size()) +
+        ", ESCAPE " + SqlLiteral(escape.data(), escape.size()) +
+        ", NULL '\\N'";
     if (ex->skip_lines > 0) sql += ", SKIP " + std::to_string(ex->skip_lines);
     sql += ")";
 

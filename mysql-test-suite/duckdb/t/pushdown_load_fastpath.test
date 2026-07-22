@@ -1,0 +1,38 @@
+# Regression test for the LOAD DATA COPY fast-path handling ENCLOSED BY.
+# A server-side LOAD DATA INFILE into an ENGINE=DuckDB table is ingested via
+# DuckDB COPY. This verifies the quoted-CSV profile (embedded delimiter inside
+# quotes, RFC-4180 doubled-quote "", and a \N NULL) loads identically to the
+# InnoDB row path, so the fast-path cannot silently mis-parse quoted files.
+--write_file $MYSQL_TMP_DIR/rfc.csv
+1|"has|pipe"|plain|abc
+2|"say ""hi"""|x|\N
+3|normal|y|z
+EOF
+
+CREATE DATABASE lf;
+USE lf;
+CREATE TABLE d (id INT, a VARCHAR(40), b VARCHAR(10), c VARCHAR(10)) ENGINE=DuckDB;
+CREATE TABLE i (id INT, a VARCHAR(40), b VARCHAR(10), c VARCHAR(10)) ENGINE=InnoDB;
+
+--disable_query_log
+eval LOAD DATA INFILE '$MYSQL_TMP_DIR/rfc.csv' INTO TABLE d
+     FIELDS TERMINATED BY '|' OPTIONALLY ENCLOSED BY '"' LINES TERMINATED BY '\n';
+eval LOAD DATA INFILE '$MYSQL_TMP_DIR/rfc.csv' INTO TABLE i
+     FIELDS TERMINATED BY '|' OPTIONALLY ENCLOSED BY '"' LINES TERMINATED BY '\n';
+--enable_query_log
+
+--echo # data loaded into the ENGINE=DuckDB table via the COPY fast-path:
+SELECT id, CONCAT('[',a,']') a, CONCAT('[',b,']') b, IFNULL(CONCAT('[',c,']'),'NULL') c
+  FROM d ORDER BY id;
+
+--echo # fast-path result must equal the InnoDB row path exactly (1 = yes):
+SELECT
+  (SELECT COUNT(*) FROM d) = (SELECT COUNT(*) FROM i)
+  AND (SELECT GROUP_CONCAT(CONCAT_WS('|', a, b, IFNULL(c,'#')) ORDER BY id SEPARATOR ';') FROM d)
+    = (SELECT GROUP_CONCAT(CONCAT_WS('|', a, b, IFNULL(c,'#')) ORDER BY id SEPARATOR ';') FROM i)
+  AS fastpath_equals_rowpath;
+
+--remove_file $MYSQL_TMP_DIR/rfc.csv
+DROP TABLE d;
+DROP TABLE i;
+DROP DATABASE lf;

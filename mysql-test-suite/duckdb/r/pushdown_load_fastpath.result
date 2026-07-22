@@ -1,0 +1,22 @@
+CREATE DATABASE lf;
+USE lf;
+CREATE TABLE d (id INT, a VARCHAR(40), b VARCHAR(10), c VARCHAR(10)) ENGINE=DuckDB;
+CREATE TABLE i (id INT, a VARCHAR(40), b VARCHAR(10), c VARCHAR(10)) ENGINE=InnoDB;
+# data loaded into the ENGINE=DuckDB table via the COPY fast-path:
+SELECT id, CONCAT('[',a,']') a, CONCAT('[',b,']') b, IFNULL(CONCAT('[',c,']'),'NULL') c
+FROM d ORDER BY id;
+id	a	b	c
+1	[has|pipe]	[plain]	[abc]
+2	[say "hi"]	[x]	NULL
+3	[normal]	[y]	[z]
+# fast-path result must equal the InnoDB row path exactly (1 = yes):
+SELECT
+(SELECT COUNT(*) FROM d) = (SELECT COUNT(*) FROM i)
+AND (SELECT GROUP_CONCAT(CONCAT_WS('|', a, b, IFNULL(c,'#')) ORDER BY id SEPARATOR ';') FROM d)
+= (SELECT GROUP_CONCAT(CONCAT_WS('|', a, b, IFNULL(c,'#')) ORDER BY id SEPARATOR ';') FROM i)
+AS fastpath_equals_rowpath;
+fastpath_equals_rowpath
+1
+DROP TABLE d;
+DROP TABLE i;
+DROP DATABASE lf;
