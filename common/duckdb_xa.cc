@@ -26,6 +26,38 @@ static std::string XidKey(const XID *xid) {
     return std::string(reinterpret_cast<const char *>(xid->key()), xid->key_length());
 }
 
+// Finish a transaction previously handed to g_prepared. Shared by the internal
+// 2PC path (Commit/Rollback with a recorded prepared_xid) and the external-XA
+// path (commit_by_xid / rollback_by_xid). Returns -1 if the key is unknown
+// (e.g. already finished), 0 on success, 1 on a DuckDB error.
+static int FinishPrepared(const std::string &key, bool commit) {
+    std::vector<std::unique_ptr<duckdb::Connection>> conns;
+    {
+        std::lock_guard<std::mutex> g(g_prepared_mu);
+        auto it = g_prepared.find(key);
+        if (it == g_prepared.end()) return -1;
+        conns = std::move(it->second);
+        g_prepared.erase(it);
+    }
+    int rc = 0;
+    try {
+        for (size_t i = 0; i < conns.size(); ++i) {
+            auto r = conns[i]->Query(commit ? "COMMIT" : "ROLLBACK");
+            if (r->HasError()) {
+                rc = 1;
+                // Best effort: roll back the branches not yet committed to limit
+                // cross-schema inconsistency (DuckDB has no cross-file 2PC).
+                if (commit)
+                    for (size_t j = i + 1; j < conns.size(); ++j) conns[j]->Query("ROLLBACK");
+                break;
+            }
+        }
+    } catch (const std::exception &) {
+        rc = 1;
+    }
+    return rc;
+}
+
 // True when the connection is inside an explicit multi-statement transaction
 // (BEGIN / autocommit=0), as opposed to a single autocommit statement.
 static bool InMultiStmtTx(THD *thd) {
@@ -119,7 +151,15 @@ int Commit(handlerton *, THD *thd, bool all) {
     if (!(all || !InMultiStmtTx(thd))) return 0;
     int rc = 0;
     try {
-        rc = GetThdState(thd).Commit();
+        auto &state = GetThdState(thd);
+        if (!state.prepared_xid.empty()) {
+            // Internal 2PC: Prepare() already handed the tx to g_prepared. Finish
+            // it here (this is the commit phase); -1 = already gone (harmless).
+            rc = FinishPrepared(state.prepared_xid, /*commit=*/true) > 0 ? HA_ERR_GENERIC : 0;
+            state.prepared_xid.clear();
+        } else {
+            rc = state.Commit();  // single-phase / autocommit (prepare was skipped)
+        }
     } catch (const std::exception &) {
         rc = HA_ERR_GENERIC;
     }
@@ -131,7 +171,13 @@ int Rollback(handlerton *, THD *thd, bool all) {
     if (!(all || !InMultiStmtTx(thd))) return 0;
     int rc = 0;
     try {
-        rc = GetThdState(thd).Rollback();
+        auto &state = GetThdState(thd);
+        if (!state.prepared_xid.empty()) {
+            rc = FinishPrepared(state.prepared_xid, /*commit=*/false) > 0 ? HA_ERR_GENERIC : 0;
+            state.prepared_xid.clear();
+        } else {
+            rc = state.Rollback();
+        }
     } catch (const std::exception &) {
         rc = HA_ERR_GENERIC;
     }
@@ -156,8 +202,11 @@ int Prepare(handlerton *, THD *thd, bool all) {
             for (auto &kv : state.connections) slot.push_back(std::move(kv.second));
         }
         state.connections.clear();
-        state.tx_open = false;  // handed off; the THD no longer owns this tx
-        ResetThdState(thd);     // drop the now-empty per-THD state
+        state.tx_open = false;      // handed off; the THD no longer owns the conns
+        state.prepared_xid = key;   // but remember which prepared entry is ours, so
+                                    // internal 2PC's Commit/Rollback(all) on THIS
+                                    // THD can finish it (commit_by_xid is only used
+                                    // by external XA). Do NOT ResetThdState here.
     } catch (const std::exception &) {
         return HA_ERR_GENERIC;
     }
@@ -165,45 +214,15 @@ int Prepare(handlerton *, THD *thd, bool all) {
 }
 
 xa_status_code CommitByXid(handlerton *, XID *xid) {
-    std::vector<std::unique_ptr<duckdb::Connection>> conns;
-    {
-        std::lock_guard<std::mutex> g(g_prepared_mu);
-        auto it = g_prepared.find(XidKey(xid));
-        if (it == g_prepared.end()) return XAER_NOTA;  // unknown XID
-        conns = std::move(it->second);
-        g_prepared.erase(it);
-    }
-    try {
-        for (size_t i = 0; i < conns.size(); ++i) {
-            auto r = conns[i]->Query("COMMIT");
-            if (r->HasError()) {
-                // Best effort: roll back the branches not yet committed to limit
-                // cross-schema inconsistency (DuckDB has no cross-file 2PC).
-                for (size_t j = i + 1; j < conns.size(); ++j) conns[j]->Query("ROLLBACK");
-                return XAER_RMERR;
-            }
-        }
-    } catch (const std::exception &) {
-        return XAER_RMERR;
-    }
-    return XA_OK;
+    int rc = FinishPrepared(XidKey(xid), /*commit=*/true);
+    if (rc < 0) return XAER_NOTA;             // unknown XID
+    return rc == 0 ? XA_OK : XAER_RMERR;
 }
 
 xa_status_code RollbackByXid(handlerton *, XID *xid) {
-    std::vector<std::unique_ptr<duckdb::Connection>> conns;
-    {
-        std::lock_guard<std::mutex> g(g_prepared_mu);
-        auto it = g_prepared.find(XidKey(xid));
-        if (it == g_prepared.end()) return XAER_NOTA;
-        conns = std::move(it->second);
-        g_prepared.erase(it);
-    }
-    try {
-        for (auto &c : conns) c->Query("ROLLBACK");
-    } catch (const std::exception &) {
-        return XAER_RMERR;
-    }
-    return XA_OK;
+    int rc = FinishPrepared(XidKey(xid), /*commit=*/false);
+    if (rc < 0) return XAER_NOTA;
+    return rc == 0 ? XA_OK : XAER_RMERR;
 }
 
 // Prepared transactions live only in memory, so after a restart there are none

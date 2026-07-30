@@ -16,6 +16,12 @@ namespace ducksdb_mysql {
 struct ThdState {
     std::map<std::string, std::unique_ptr<duckdb::Connection>> connections;
     bool tx_open = false;    // a BEGIN has been issued on the connections
+    // Set at Prepare() when this THD's transaction was handed to the global
+    // prepared registry (g_prepared). Internal two-phase commit finishes such a
+    // transaction via Commit/Rollback(all=true) on the SAME THD (NOT
+    // commit_by_xid, which is only the external-XA path), so we remember which
+    // entry to finish. Empty when the transaction was not prepared.
+    std::string prepared_xid;
 
     // Get-or-open the connection for `schema`; begins it if a tx is already open.
     duckdb::Connection &Acquire(const std::string &schema);

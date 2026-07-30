@@ -1,0 +1,43 @@
+CREATE DATABASE mx;
+USE mx;
+CREATE TABLE d (id INT PRIMARY KEY, v INT) ENGINE=DuckDB;
+CREATE TABLE i (id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+# committed mixed-engine transaction: BOTH tables must keep their rows
+BEGIN;
+INSERT INTO d VALUES (1,10),(2,20),(3,30);
+INSERT INTO i VALUES (1,10),(2,20),(3,30);
+Warnings:
+Warning	6414	Combining the storage engines InnoDB and DuckDB is deprecated, but the statement or transaction updates both the InnoDB table mx.i and the DuckDB table mx.d.
+COMMIT;
+SELECT COUNT(*) AS duck_rows FROM d;
+duck_rows
+3
+SELECT COUNT(*) AS inno_rows FROM i;
+inno_rows
+3
+# the DuckDB half must equal the InnoDB half (1 = yes; 0 = rows were dropped)
+SELECT (SELECT COUNT(*) FROM d) = (SELECT COUNT(*) FROM i) AS duck_equals_inno;
+duck_equals_inno
+1
+# values survived intact, not just the row count
+SELECT id, v FROM d ORDER BY id;
+id	v
+1	10
+2	20
+3	30
+# rolled-back mixed-engine transaction: NEITHER table keeps the new row
+BEGIN;
+INSERT INTO d VALUES (4,40);
+INSERT INTO i VALUES (4,40);
+Warnings:
+Warning	6414	Combining the storage engines InnoDB and DuckDB is deprecated, but the statement or transaction updates both the InnoDB table mx.i and the DuckDB table mx.d.
+ROLLBACK;
+SELECT COUNT(*) AS duck_after_rollback FROM d WHERE id=4;
+duck_after_rollback
+0
+SELECT COUNT(*) AS inno_after_rollback FROM i WHERE id=4;
+inno_after_rollback
+0
+DROP TABLE d;
+DROP TABLE i;
+DROP DATABASE mx;

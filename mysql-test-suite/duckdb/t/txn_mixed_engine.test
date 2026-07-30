@@ -1,0 +1,37 @@
+# Regression: a single transaction that writes to BOTH a DuckDB table and an
+# InnoDB table must commit (or roll back) BOTH. Two participating engines force
+# real two-phase commit (prepare + commit), the path a replication applier always
+# takes (data in DuckDB + position in the InnoDB mysql.* info tables).
+#
+# The bug this guards: Prepare() handed the DuckDB transaction to the XA
+# prepared-registry and reset the THD state; the internal-2PC Commit() then found
+# an empty state and committed nothing, silently dropping every DuckDB row while
+# InnoDB and the binlog committed.
+CREATE DATABASE mx;
+USE mx;
+CREATE TABLE d (id INT PRIMARY KEY, v INT) ENGINE=DuckDB;
+CREATE TABLE i (id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+
+--echo # committed mixed-engine transaction: BOTH tables must keep their rows
+BEGIN;
+INSERT INTO d VALUES (1,10),(2,20),(3,30);
+INSERT INTO i VALUES (1,10),(2,20),(3,30);
+COMMIT;
+SELECT COUNT(*) AS duck_rows FROM d;
+SELECT COUNT(*) AS inno_rows FROM i;
+--echo # the DuckDB half must equal the InnoDB half (1 = yes; 0 = rows were dropped)
+SELECT (SELECT COUNT(*) FROM d) = (SELECT COUNT(*) FROM i) AS duck_equals_inno;
+--echo # values survived intact, not just the row count
+SELECT id, v FROM d ORDER BY id;
+
+--echo # rolled-back mixed-engine transaction: NEITHER table keeps the new row
+BEGIN;
+INSERT INTO d VALUES (4,40);
+INSERT INTO i VALUES (4,40);
+ROLLBACK;
+SELECT COUNT(*) AS duck_after_rollback FROM d WHERE id=4;
+SELECT COUNT(*) AS inno_after_rollback FROM i WHERE id=4;
+
+DROP TABLE d;
+DROP TABLE i;
+DROP DATABASE mx;
