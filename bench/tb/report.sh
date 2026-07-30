@@ -43,7 +43,7 @@ HTML="$RESULTS_DIR/summary.html"
 <h1>TPC-H SF$SF &mdash; engine comparison</h1>
 <div class="meta">generated $(date -u +%FT%TZ) &middot; $(node_cores) cores, $(hr "$(node_ram_bytes)") RAM</div>
 EOF
-  for c in chart-summary chart-query-times chart-load-time chart-storage; do
+  for c in chart-summary chart-query-times chart-load-time chart-storage chart-replication; do
     f="$CHARTS/$c.png"
     [ -f "$f" ] && printf '<h2>%s</h2>\n<img src="charts/%s.png" alt="%s">\n' \
       "$(echo "$c" | sed 's/chart-//; s/-/ /g')" "$c" "$c"
@@ -51,6 +51,11 @@ EOF
   echo '<h2>Full report</h2><pre>'
   [ -f "$REPORT" ] && sed -e 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' "$REPORT"
   echo '</pre>'
+  if [ -f "$RESULTS_DIR/replication-spike.txt" ]; then
+    echo '<h2>Replication spike (InnoDB master &rarr; DuckDB replica)</h2><pre>'
+    sed -e 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' "$RESULTS_DIR/replication-spike.txt"
+    echo '</pre>'
+  fi
 } > "$HTML"
 
 # ---- 4. bundle ---------------------------------------------------------------

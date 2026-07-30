@@ -11,3 +11,6 @@ bench/data-sf*/
 
 # regenerable harness archive (make-archive.sh)
 bench/tpch-tb-harness.tar.gz
+
+# python bytecode (charts.py runs in a container)
+__pycache__/

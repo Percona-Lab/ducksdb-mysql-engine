@@ -269,6 +269,76 @@ def chart_summary(results, sf, outdir):
     return p
 
 
+def read_replication(results):
+    """Parse replication-metrics.txt -> (checks, throughput_rows_s | None).
+
+    checks is a list of (status, label) in run order; status in PASS/FAIL/NOTE.
+    Returns None when there is no metrics file (07 was not run).
+    """
+    path = os.path.join(results, "replication-metrics.txt")
+    if not os.path.exists(path):
+        return None
+    checks, thru = [], None
+    with open(path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line or "\t" not in line:
+                continue
+            key, val = line.split("\t", 1)
+            if key == "THROUGHPUT_ROWS_S":
+                try:
+                    thru = float(val)
+                except ValueError:
+                    pass
+            elif key in ("PASS", "FAIL", "NOTE"):
+                checks.append((key, val))
+    if not checks and thru is None:
+        return None
+    return checks, thru
+
+
+def chart_replication(results, outdir):
+    """Per-check PASS/FAIL/NOTE status strip for the replication spike."""
+    parsed = read_replication(results)
+    if not parsed:
+        return None
+    checks, thru = parsed
+    if not checks:
+        return None
+    status_color = {"PASS": "#4c9a63", "FAIL": "#b0464a", "NOTE": "#c9a227"}
+    n = len(checks)
+    labels = [(l if len(l) <= 64 else l[:61] + "...") for _, l in checks]
+    colors = [status_color.get(s, "#888888") for s, _ in checks]
+
+    fig, ax = plt.subplots(figsize=(11, max(3.0, 0.42 * n + 1.3)))
+    y = np.arange(n)
+    ax.barh(y, [1] * n, color=colors, height=0.72)
+    for i, (s, _) in enumerate(checks):
+        ax.text(1.02, i, s, va="center", fontsize=8.5, fontweight="bold",
+                color=status_color.get(s, "#888888"))
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=8.5)
+    ax.invert_yaxis()                    # first check on top
+    ax.set_xlim(0, 1.2)
+    ax.set_xticks([])
+    for sp in ("top", "right", "bottom", "left"):
+        ax.spines[sp].set_visible(False)
+
+    npass = sum(1 for s, _ in checks if s == "PASS")
+    nfail = sum(1 for s, _ in checks if s == "FAIL")
+    nnote = sum(1 for s, _ in checks if s == "NOTE")
+    title = ("Replication: InnoDB master → DuckDB replica    "
+             "PASS=%d  FAIL=%d  NOTE=%d" % (npass, nfail, nnote))
+    if thru:
+        title += "\napply throughput ~{:,.0f} rows/s".format(thru)
+    ax.set_title(title, fontsize=12)
+    fig.tight_layout()
+    p = os.path.join(outdir, "chart-replication.png")
+    fig.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return p
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", required=True)
@@ -281,7 +351,8 @@ def main():
     for fn in (lambda: chart_query_times(a.results, a.sf, a.out),
                lambda: chart_load_time(a.results, a.out),
                lambda: chart_storage(a.results, a.out),
-               lambda: chart_summary(a.results, a.sf, a.out)):
+               lambda: chart_summary(a.results, a.sf, a.out),
+               lambda: chart_replication(a.results, a.out)):
         try:
             p = fn()
             if p:
